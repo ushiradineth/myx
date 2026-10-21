@@ -76,7 +76,14 @@ pub(crate) fn handle_key(
 
     match code {
         KeyCode::Char('e') => {
-            app.view.equalizer = Some(EqualizerOverlay::default());
+            if app.svc.engine.capabilities().local_dsp {
+                app.view.equalizer = Some(EqualizerOverlay::default());
+            } else {
+                app.status = format!(
+                    "{} does not support local PCM EQ/FFT",
+                    app.svc.engine.name()
+                );
+            }
         }
         KeyCode::Char('/') => {
             app.search.input_mode = true;
@@ -96,6 +103,13 @@ pub(crate) fn handle_key(
             if app.transport.playback_started {
                 let _ = app.svc.engine.toggle();
             } else {
+                if matches!(app.transport.source, PlaySource::Radio(_))
+                    && !app.svc.engine.capabilities().radio
+                {
+                    app.status =
+                        format!("{} does not support Mercury radio", app.svc.engine.name());
+                    return false;
+                }
                 // Resume the persisted source (context/radio/liked).
                 resume_source(app, &chans.radio);
                 app.transport.playback_started = true;
@@ -139,6 +153,12 @@ pub(crate) fn handle_key(
             let _ = app.svc.engine.repeat(app.transport.repeat);
         }
         KeyCode::Char('r') => {
+            if !app.svc.webapi.lock().is_ok_and(|api| api.is_available()) {
+                app.status =
+                    "Web API browsing is not configured; Soloist playback is still available"
+                        .into();
+                return false;
+            }
             app.status = "loading library…".to_string();
             app.browse.library.reset_loading();
             spawn_library_fetch(
@@ -196,13 +216,13 @@ pub(crate) fn handle_key(
         KeyCode::Right => {
             app.view.mode = app.view.mode.shift(1);
             if app.view.mode == RightView::Queue && app.transport.playback_started {
-                spawn_queue_fetch(app.svc.webapi.clone(), chans.queue.clone());
+                request_visible_queue(app, chans);
             }
         }
         KeyCode::Left => {
             app.view.mode = app.view.mode.shift(-1);
             if app.view.mode == RightView::Queue && app.transport.playback_started {
-                spawn_queue_fetch(app.svc.webapi.clone(), chans.queue.clone());
+                request_visible_queue(app, chans);
             }
         }
         // The frame loop notices the layout change and wipes the art box.
@@ -221,37 +241,61 @@ pub(crate) fn handle_key(
         KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
         // Needs a terminal that reports modified Enter (kitty, WezTerm, foot).
         KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => play_selected_context(app, false),
-        KeyCode::Enter => match app.activate() {
-            Activated::Open(uri, name) => {
-                spawn_detail_fetch(app.svc.webapi.clone(), uri, name, chans.detail.clone());
+        KeyCode::Enter => {
+            // activate() records the radio source, so reject before mutating it.
+            if app.search.searching
+                && app
+                    .cur_items()
+                    .get(app.browse.selected)
+                    .is_some_and(|item| item.is_track())
+                && !app.svc.engine.capabilities().radio
+            {
+                app.status = format!("{} does not support Mercury radio", app.svc.engine.name());
+                return false;
             }
-            Activated::Radio(uri) => {
-                app.status = "starting radio…".to_string();
-                let session = app.svc.engine.session();
-                let tx = chans.radio.clone();
-                tokio::spawn(async move {
-                    let res = match tokio::time::timeout(
-                        Duration::from_secs(12),
-                        engine::radio_tracks(&session, &uri),
-                    )
-                    .await
-                    {
-                        Ok(r) => r.map_err(|e| e.to_string()),
-                        Err(_) => {
-                            Err("timed out (mercury radio endpoint unresponsive)".to_string())
-                        }
-                    };
-                    let _ = tx.send(res.map(|uris| Radio {
-                        uris,
-                        start_position_ms: 0,
-                    }));
-                });
+            match app.activate() {
+                Activated::Open(uri, name) => {
+                    spawn_detail_fetch(app.svc.webapi.clone(), uri, name, chans.detail.clone());
+                }
+                Activated::Radio(uri) => {
+                    if !app.svc.engine.capabilities().radio {
+                        app.status =
+                            format!("{} does not support Mercury radio", app.svc.engine.name());
+                        return false;
+                    }
+                    app.status = "starting radio…".to_string();
+                    let tracks = app.svc.engine.radio_tracks(uri);
+                    let tx = chans.radio.clone();
+                    tokio::spawn(async move {
+                        let res = match tokio::time::timeout(Duration::from_secs(12), tracks).await
+                        {
+                            Ok(r) => r.map_err(|e| e.to_string()),
+                            Err(_) => {
+                                Err("timed out (mercury radio endpoint unresponsive)".to_string())
+                            }
+                        };
+                        let _ = tx.send(res.map(|uris| Radio {
+                            uris,
+                            start_position_ms: 0,
+                        }));
+                    });
+                }
+                Activated::None => {}
             }
-            Activated::None => {}
-        },
+        }
         _ => {}
     }
     false
+}
+
+fn request_visible_queue(app: &mut App, chans: &UiChannels) {
+    if app.svc.engine.is_soloist() {
+        if let Err(e) = app.svc.engine.request_queue() {
+            app.status = format!("queue refresh failed: {e}");
+        }
+    } else {
+        spawn_queue_fetch(app.svc.webapi.clone(), chans.queue.clone());
+    }
 }
 
 /// Keys whose whole effect is on the library pane.

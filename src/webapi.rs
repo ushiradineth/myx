@@ -162,6 +162,43 @@ pub struct WebApi {
 }
 
 impl WebApi {
+    /// Playback-only backends do not need a separate Web API OAuth client.
+    pub fn disabled() -> Self {
+        Self {
+            client_id: String::new(),
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: u64::MAX,
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        !self.access_token.is_empty()
+    }
+
+    pub fn is_configured() -> bool {
+        configured_client_id().is_some()
+    }
+
+    /// Never open a browser or prompt. An unavailable browsing API must not
+    /// prevent explicitly selected Soloist playback from starting.
+    pub fn init_optional() -> Self {
+        let Some(id) = configured_client_id() else {
+            return Self::disabled();
+        };
+        let Some(mut api) = Self::from_cache(&id) else {
+            return Self::disabled();
+        };
+        if api.is_expiring() && api.refresh().is_err() {
+            return Self::disabled();
+        }
+        if api.is_available() {
+            api
+        } else {
+            Self::disabled()
+        }
+    }
+
     /// Whether [`WebApi::init`] can start from cache instead of prompting, so
     /// the caller can do the interactive part before a TUI takes the screen. An
     /// expired token still counts: refreshing it is silent.
@@ -204,6 +241,10 @@ impl WebApi {
 
     /// Return a currently-valid access token, refreshing if it's about to expire.
     pub fn valid_token(&mut self) -> Result<String> {
+        anyhow::ensure!(
+            self.is_available(),
+            "Web API browsing is not configured; playback can still use Soloist"
+        );
         if self.is_expiring() {
             self.refresh().context("refresh web token")?;
         }

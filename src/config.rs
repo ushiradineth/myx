@@ -1,14 +1,146 @@
-//! User settings from `~/.config/myx/config.toml`. Missing, empty or malformed
-//! all fall back to defaults — a typo must never lock someone out of the app.
+//! User settings from `~/.config/myx/config.toml`. Missing/empty files use
+//! defaults; invalid configuration must not silently select another backend.
 
 use librespot_playback::config::Bitrate;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::{fmt, str::FromStr};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Normal,
+    Soloist,
+}
+
+impl BackendKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Soloist => "soloist",
+        }
+    }
+}
+
+impl fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BackendKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "soloist" => Ok(Self::Soloist),
+            _ => anyhow::bail!("unsupported backend; expected normal or soloist"),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct SoloistConfig {
+    pub directory: Option<PathBuf>,
+    pub endpoint: Option<String>,
+    pub sdk: Option<PathBuf>,
+    pub runner: Option<PathBuf>,
+    pub sysroot: Option<PathBuf>,
+    pub library_manifest: Option<PathBuf>,
+    pub library_path: Option<String>,
+    pub audio_tools: Option<PathBuf>,
+    pub api_key: Option<String>,
+    pub api_key_file: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub expected_sdk_sha256: Option<String>,
+    pub device_name: String,
+    pub initial_volume: u8,
+    pub dsp: bool,
+}
+
+impl Default for SoloistConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            endpoint: None,
+            sdk: None,
+            runner: None,
+            sysroot: None,
+            library_manifest: None,
+            library_path: None,
+            audio_tools: None,
+            api_key: None,
+            api_key_file: None,
+            data_dir: None,
+            cache_dir: None,
+            expected_sdk_sha256: None,
+            device_name: "myx".into(),
+            initial_volume: 25,
+            dsp: true,
+        }
+    }
+}
+
+impl SoloistConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.api_key.is_none() || self.api_key_file.is_none(),
+            "configure only one of soloist.api_key and soloist.api_key_file"
+        );
+        Ok(())
+    }
+
+    /// Resolve paths lexically, without reading or creating runtime data.
+    /// Relative paths are rejected rather than depending on the launch directory.
+    pub fn directory(&self) -> anyhow::Result<PathBuf> {
+        let path = match &self.directory {
+            Some(path) => path.clone(),
+            None => crate::home_dir()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Soloist requires a home directory or an absolute directory setting"
+                    )
+                })?
+                .join(".config/myx/soloist"),
+        };
+        absolute_soloist_path(&path)
+    }
+
+    pub fn resolve(&self, value: Option<&PathBuf>, fallback: &str) -> anyhow::Result<PathBuf> {
+        match value {
+            Some(path) => absolute_soloist_path(path),
+            None => absolute_soloist_path(&self.directory()?.join(fallback)),
+        }
+    }
+}
+
+fn absolute_soloist_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let expanded = if let Ok(rest) = path.strip_prefix("~") {
+        crate::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot expand Soloist path without a home directory"))?
+            .join(rest)
+    } else {
+        path.to_path_buf()
+    };
+    anyhow::ensure!(
+        expanded.is_absolute(),
+        "Soloist paths must be absolute (or start with ~/)"
+    );
+    Ok(expanded)
+}
 
 #[derive(Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(skip)]
+    load_error: Option<&'static str>,
+    /// Playback engine. Soloist is explicitly opt-in; `api` is a legacy alias.
+    #[serde(alias = "api")]
+    pub backend: String,
+    pub soloist: SoloistConfig,
     /// Rows kept visible above and below the list cursor, like vim's `scrolloff`.
     pub scrolloff: usize,
     /// Show the locally saved track, source and position when Myx starts,
@@ -39,6 +171,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            load_error: None,
+            backend: "normal".into(),
+            soloist: SoloistConfig::default(),
             scrolloff: 3,
             restore_on_startup: true,
             client_id: None,
@@ -90,9 +225,41 @@ const TEMPLATE: &str = "\
 # instead of the album-tinted one. Text and accents still follow the cover.
 # Press T in myx to flip it; this line is rewritten when you do.
 transparent = true
+
+# Playback backend: normal (default), or opt in with backend = \"soloist\".
+# The legacy spelling api = \"soloist\" is also accepted.
+#backend = \"normal\"
+
+# Optional Soloist settings. Paths must be absolute or start with ~/.
+# Defaults live under ~/.config/myx/soloist; nothing is installed automatically.
+#[soloist]
+#directory = \"~/.config/myx/soloist\"
+#device_name = \"myx\"
+#initial_volume = 25
+#dsp = true # managed playback EQ/spectrum; false explicitly bypasses processing
+#sdk = \"/absolute/path/to/sdk\"
+#runner = \"/absolute/path/to/runner\"
+# Inline alternative to api_key_file. Keep config.toml private (chmod 600).
+#api_key = \"YOUR_SOLOIST_API_KEY\"
+#api_key_file = \"/absolute/path/to/api-key\"
 ";
 
 impl Config {
+    pub fn backend_kind(&self) -> anyhow::Result<BackendKind> {
+        if let Some(message) = self.load_error {
+            anyhow::bail!(message);
+        }
+        self.backend.parse()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(message) = self.load_error {
+            anyhow::bail!(message);
+        }
+        self.soloist.validate()?;
+        Ok(())
+    }
+
     pub fn path() -> Option<PathBuf> {
         Some(crate::home_dir()?.join(".config/myx/config.toml"))
     }
@@ -104,10 +271,13 @@ impl Config {
         if !path.exists() {
             write_template(&path);
         }
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| Self::parse(&s))
-            .unwrap_or_default()
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::parse(&text).unwrap_or_else(|| Self {
+                load_error: Some("myx configuration is invalid; fix config.toml before selecting a playback backend"),
+                ..Self::default()
+            }),
+            Err(_) => Self { load_error: Some("myx configuration could not be read"), ..Self::default() },
+        }
     }
 
     fn parse(s: &str) -> Option<Self> {
@@ -210,6 +380,86 @@ fn set_key(text: &str, key: &str, value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn soloist_inline_and_file_credentials_are_mutually_exclusive() {
+        let config = Config::parse(
+            "[soloist]\napi_key = \"PRIVATE-SENTINEL\"\napi_key_file = \"/private/key\"",
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("api_key"));
+        assert!(!error.contains("PRIVATE-SENTINEL"));
+    }
+
+    #[test]
+    fn soloist_inline_key_is_read_from_config_and_survives_setting_updates() {
+        let text = "backend = \"soloist\"\n[soloist]\napi_key = \"PRIVATE-SENTINEL\"\n";
+        let updated = set_key(text, "transparent", "true");
+        let config = Config::parse(&updated).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.soloist.api_key.as_deref(), Some("PRIVATE-SENTINEL"));
+        assert!(config.soloist.api_key_file.is_none());
+        assert!(config.transparent);
+    }
+
+    #[test]
+    fn backend_selection_is_explicit_and_invalid_names_never_fall_back() {
+        for text in ["", TEMPLATE, "backend = \"normal\""] {
+            assert_eq!(
+                Config::parse(text).unwrap().backend_kind().unwrap(),
+                BackendKind::Normal
+            );
+        }
+        for key in ["backend", "api"] {
+            let config = Config::parse(&format!("{key} = \"soloist\"\nscrolloff = 7")).unwrap();
+            assert_eq!(config.backend_kind().unwrap(), BackendKind::Soloist);
+            assert_eq!(config.scrolloff, 7);
+            let config = Config::parse(&format!("{key} = \"typo\"")).unwrap();
+            assert!(config.backend_kind().is_err());
+            assert_eq!(config.backend, "typo");
+        }
+        for backend in [BackendKind::Normal, BackendKind::Soloist] {
+            assert_eq!(backend.to_string().parse::<BackendKind>().unwrap(), backend);
+        }
+    }
+
+    #[test]
+    fn soloist_defaults_and_paths_are_resolved_without_io() {
+        let config = Config::parse("[soloist]\nendpoint = \"http://localhost:1234\"").unwrap();
+        assert_eq!(config.soloist.device_name, "myx");
+        assert_eq!(config.soloist.initial_volume, 25);
+        assert_eq!(
+            config.soloist.endpoint.as_deref(),
+            Some("http://localhost:1234")
+        );
+        if let Some(home) = crate::home_dir() {
+            assert_eq!(
+                config.soloist.directory().unwrap(),
+                home.join(".config/myx/soloist")
+            );
+        }
+        let root = std::env::temp_dir().join("myx-soloist-path-only");
+        let mut soloist = SoloistConfig {
+            directory: Some(root.clone()),
+            ..SoloistConfig::default()
+        };
+        assert_eq!(soloist.resolve(None, "sdk").unwrap(), root.join("sdk"));
+        let explicit = root.join("elsewhere");
+        assert_eq!(
+            soloist.resolve(Some(&explicit), "ignored").unwrap(),
+            explicit
+        );
+        assert!(soloist
+            .resolve(Some(&PathBuf::from("relative")), "sdk")
+            .is_err());
+        soloist.directory = Some(PathBuf::from("relative"));
+        assert!(soloist.directory().is_err());
+        assert_eq!(
+            soloist.resolve(Some(&explicit), "ignored").unwrap(),
+            explicit
+        );
+    }
+
     fn set_transparent(text: &str, on: bool) -> String {
         set_key(text, "transparent", &on.to_string())
     }
@@ -298,8 +548,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_falls_back_rather_than_failing() {
+    fn malformed_config_cannot_silently_select_a_backend() {
         assert!(Config::parse("scrolloff = \"three\"").is_none());
+        let config = Config {
+            load_error: Some("invalid configuration"),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(config.backend_kind().is_err());
     }
 
     #[test]

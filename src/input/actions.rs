@@ -90,7 +90,12 @@ pub(crate) fn handle_action_key(
             app.view.actions = None;
         }
         other => {
-            spawn_action(app.svc.webapi.clone(), other, astatus_tx.clone());
+            spawn_action(
+                &app.svc.engine,
+                app.svc.webapi.clone(),
+                other,
+                astatus_tx.clone(),
+            );
             app.view.actions = None;
         }
     }

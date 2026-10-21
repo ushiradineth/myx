@@ -48,7 +48,9 @@ use myx::audio::{
     EqualizerPreset, EqualizerSettings, EQ_FREQUENCIES_HZ, MAX_EQ_GAIN_DB, MIN_EQ_GAIN_DB,
     NUM_BANDS, NUM_EQ_BANDS,
 };
+use myx::cli::Cli;
 use myx::components::{gradient_line, gradient_progress, left_bar_block};
+use myx::config::BackendKind;
 use myx::cover::Cover;
 use myx::engine::{self, Engine, EngineEvent};
 use myx::gradient::{self};
@@ -68,6 +70,51 @@ use souvlaki::{
 
 // ------------------------------------------------------------------ main
 
+struct Startup {
+    prepared: engine::Prepared,
+    webapi: WebApi,
+    uri: Option<String>,
+}
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+    async fn recv(&mut self) -> io::Result<()> {
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
+            _ = self.hangup.recv() => {},
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+    async fn recv(&mut self) -> io::Result<()> {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 fn main() -> Result<()> {
     // `myx theme …` is a socket client, not a player: it must not authorize
     // with Spotify, start librespot, or touch the terminal. Intercepting argv
@@ -82,6 +129,27 @@ fn main() -> Result<()> {
         }
     }
 
+    let cli = Cli::parse_from(std::env::args())?;
+    if cli.help {
+        println!("myx [--backend normal|soloist] [SPOTIFY_URI_OR_URL]\n  --api normal|soloist   Alias for --backend\n  --no-web-api           Playback without optional library browsing\n  --non-interactive      Never start browser authorization\n  --headless --duration SECONDS  Bounded playback without a terminal\n  --volume 0..100        Initial playback volume\nBackend selection: CLI, MYX_BACKEND, then ~/.config/myx/config.toml.");
+        return Ok(());
+    }
+    if cli.headless {
+        anyhow::ensure!(
+            cli.uri.as_deref().is_some_and(
+                |uri| uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")
+            ),
+            "headless playback requires an explicit track or episode URI"
+        );
+    }
+    myx::config::get().validate()?;
+    let backend = match cli.backend {
+        Some(backend) => backend,
+        None => match std::env::var("MYX_BACKEND") {
+            Ok(value) => value.parse()?,
+            Err(_) => myx::config::get().backend_kind()?,
+        },
+    };
     install_librespot_log();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -91,26 +159,61 @@ fn main() -> Result<()> {
 
     // Restore last session first, so the engine starts at the saved volume.
     let saved = SavedState::load();
-    let init_vol = if saved.volume == 0 {
-        80
-    } else {
-        saved.volume.min(100)
+    let init_vol = cli.volume.unwrap_or_else(|| match backend {
+        BackendKind::Soloist => myx::config::get().soloist.initial_volume.min(100),
+        BackendKind::Normal => {
+            if saved.volume == 0 {
+                80
+            } else {
+                saved.volume.min(100)
+            }
+        }
+    });
+
+    let authorize = || -> Result<Startup> {
+        let prepared = engine::prepare(backend, cli.non_interactive || cli.headless)?;
+        let webapi = if cli.no_web_api {
+            WebApi::disabled()
+        } else if cli.non_interactive || cli.headless {
+            let api = WebApi::init_optional();
+            if backend == BackendKind::Normal && !api.is_available() {
+                anyhow::bail!("Web API authorization is unavailable; run myx interactively or use --no-web-api");
+            }
+            api
+        } else if backend == BackendKind::Normal || WebApi::is_configured() {
+            WebApi::init().context("authorize web api")?
+        } else {
+            WebApi::init_optional()
+        };
+        Ok(Startup {
+            prepared,
+            webapi,
+            uri: cli.uri.clone(),
+        })
     };
+    if cli.headless {
+        let startup = authorize()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        return runtime.block_on(run_headless(
+            startup,
+            init_vol,
+            cli.duration.expect("validated duration"),
+            saved.equalizer.normalized(),
+        ));
+    }
 
     // OAuth may need to print a browser URL, including when a cached refresh
     // token has been revoked. Complete both auth flows before entering the
     // alternate screen so that recovery prompts can never be hidden by the TUI.
-    if engine::needs_authorization() || !WebApi::is_cached() {
+    if (backend == BackendKind::Normal && engine::needs_authorization())
+        || (!cli.no_web_api && WebApi::is_configured() && !WebApi::is_cached())
+    {
         println!("myx: first run — authorizing with Spotify…");
     }
-    let ((creds, webapi), terminal) = auth_then_terminal(
-        || {
-            let creds = engine::credentials()?;
-            let webapi = WebApi::init().context("authorize web api")?;
-            Ok((creds, webapi))
-        },
-        init_terminal,
-    )?;
+    let (startup, terminal) = auth_then_terminal(authorize, init_terminal)?;
 
     // Query the terminal for its graphics protocol before anything else is
     // running: picking sixel swaps `TERM` around the query, and `setenv` is only
@@ -127,9 +230,9 @@ fn main() -> Result<()> {
     ));
 
     #[cfg(target_os = "macos")]
-    let res = run_player_macos(terminal, saved, init_vol, creds, webapi, picker);
+    let res = run_player_macos(terminal, saved, init_vol, startup, picker);
     #[cfg(not(target_os = "macos"))]
-    let res = run_player(terminal, saved, init_vol, creds, webapi, picker, true);
+    let res = run_player(terminal, saved, init_vol, startup, picker, true);
     res
 }
 
@@ -137,8 +240,7 @@ fn run_player(
     mut terminal: Term,
     saved: SavedState,
     init_vol: u8,
-    creds: librespot_core::authentication::Credentials,
-    webapi: WebApi,
+    startup: Startup,
     picker: Picker,
     media_platform_ready: bool,
 ) -> Result<()> {
@@ -151,8 +253,7 @@ fn run_player(
         &mut terminal,
         saved,
         init_vol,
-        creds,
-        webapi,
+        startup,
         picker,
         media_platform_ready,
     ));
@@ -181,8 +282,7 @@ fn run_player_macos(
     terminal: Term,
     saved: SavedState,
     init_vol: u8,
-    creds: librespot_core::authentication::Credentials,
-    webapi: WebApi,
+    startup: Startup,
     picker: Picker,
 ) -> Result<()> {
     use winit::application::ApplicationHandler;
@@ -218,13 +318,13 @@ fn run_player_macos(
         Ok(event_loop) => event_loop,
         Err(e) => {
             liblog(format!("media event loop unavailable: {e}"));
-            return run_player(terminal, saved, init_vol, creds, webapi, picker, false);
+            return run_player(terminal, saved, init_vol, startup, picker, false);
         }
     };
 
     let proxy = event_loop.create_proxy();
     let player = std::thread::spawn(move || {
-        let res = run_player(terminal, saved, init_vol, creds, webapi, picker, true);
+        let res = run_player(terminal, saved, init_vol, startup, picker, true);
         let _ = proxy.send_event(PlayerDone);
         res
     });
@@ -323,29 +423,33 @@ async fn boot(
     terminal: &mut Term,
     saved: SavedState,
     init_vol: u8,
-    creds: librespot_core::authentication::Credentials,
-    webapi: WebApi,
+    startup: Startup,
     picker: Picker,
     media_platform_ready: bool,
 ) -> Result<MxcHandle> {
+    let mut shutdown = ShutdownSignals::new()?;
     let (ev_tx, ev_rx) = flume::unbounded::<EngineEvent>();
-    let engine = with_loader(
-        terminal,
-        "connecting to Spotify",
-        engine::run(creds, ev_tx, init_vol),
-    )
+    let engine = with_loader(terminal, "connecting to Spotify", async {
+        tokio::select! {
+            result = engine::start(startup.prepared, ev_tx, init_vol) => result,
+            signal = shutdown.recv() => { signal?; anyhow::bail!("playback startup cancelled"); }
+        }
+    })
     .await?
     .context("start engine")?;
     let equalizer = saved.equalizer.normalized();
     engine.set_equalizer(equalizer);
 
-    let webapi = Arc::new(Mutex::new(webapi));
+    let web_available = startup.webapi.is_available();
+    let webapi = Arc::new(Mutex::new(startup.webapi));
 
     // The one positional argument is a Spotify URI. It always wins over a
     // persisted session; `theme` never reaches here (see `main`).
-    let startup_uri = std::env::args().nth(1).filter(|a| a != "theme");
+    let startup_uri = startup.uri;
     if let Some(uri) = startup_uri.as_ref() {
-        let _ = engine.play_context(uri.clone(), false);
+        engine
+            .play_context(uri.clone(), false)
+            .context("start requested playback")?;
     }
 
     let restore_on_startup = should_restore_saved_playback(
@@ -398,7 +502,7 @@ async fn boot(
         liblog("media controls unavailable; continuing without native integration");
     }
 
-    let app = App {
+    let mut app = App {
         svc: Services {
             engine,
             picker,
@@ -418,7 +522,12 @@ async fn boot(
             target: startup_theme(),
             fade: None,
         },
-        status: "loading library…".to_string(),
+        status: if web_available {
+            "loading library…".to_string()
+        } else {
+            "Web API browsing is not configured; playback and Soloist queue remain available"
+                .to_string()
+        },
         browse: BrowseState {
             library: Library::default(),
             section: Section::Home,
@@ -429,11 +538,7 @@ async fn boot(
         transport: Transport {
             shuffle: saved.shuffle,
             repeat: saved.repeat,
-            volume: if saved.volume == 0 {
-                80
-            } else {
-                saved.volume.min(100)
-            },
+            volume: init_vol,
             queue,
             queue_uris,
             playback_started: startup_uri.is_some(),
@@ -466,7 +571,62 @@ async fn boot(
         art_repaint: ArtRepaint::Idle,
     };
 
-    run_ui(terminal, app, ev_rx).await
+    if !web_available {
+        app.browse.library.mark_all_loaded();
+    }
+    run_ui(terminal, app, ev_rx, shutdown).await
+}
+
+/// Automation uses the same selected engine and events as the TUI, without
+/// creating a terminal, image renderer or media event loop.
+async fn run_headless(
+    startup: Startup,
+    volume: u8,
+    duration: Duration,
+    equalizer: EqualizerSettings,
+) -> Result<()> {
+    let mut shutdown = ShutdownSignals::new()?;
+    let (tx, rx) = flume::unbounded();
+    let engine = tokio::select! {
+        result = engine::start(startup.prepared, tx, volume) => result?,
+        signal = shutdown.recv() => { signal?; anyhow::bail!("playback startup cancelled"); }
+    };
+    engine.set_equalizer(equalizer);
+    let result = async {
+        let uri = startup.uri.context("headless playback requires a Spotify URI")?;
+        engine.play_context(uri.clone(), false)?;
+        let deadline = tokio::time::sleep(duration);
+        tokio::pin!(deadline);
+        let mut played = false;
+        let mut available = true;
+        println!("myx: {} backend started", engine.name());
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                signal = shutdown.recv() => { signal?; break; },
+                event = rx.recv_async() => match event.context("playback worker closed")? {
+                    EngineEvent::Playing { uri: playing, .. } if played || playing == uri => { played = true; available = true; },
+                    EngineEvent::Stopped | EngineEvent::Reconnecting => available = false,
+                    EngineEvent::BackendStatus { message } => eprintln!("myx: {message}"),
+                    EngineEvent::Metadata(meta) => println!("myx: {} — {}", meta.artist, meta.title),
+                    _ => {},
+                }
+            }
+        }
+        anyhow::ensure!(played && available, "requested playback did not become available");
+        Ok(())
+    }.await;
+    #[cfg(feature = "soloist")]
+    let audio_stats = engine.audio_stats();
+    let cleanup = engine.shutdown();
+    result?;
+    cleanup.context("shutdown playback backend")?;
+    #[cfg(feature = "soloist")]
+    if let Some(stats) = audio_stats {
+        println!("myx: native PCM processed {} frames; peak pending {} frames; estimated stream buffering {} us",
+            stats.processed_frames, stats.peak_pending_frames, stats.estimated_latency_micros);
+    }
+    Ok(())
 }
 
 struct Radio {
@@ -493,6 +653,7 @@ async fn run_ui(
     terminal: &mut Term,
     mut app: App,
     ev_rx: flume::Receiver<EngineEvent>,
+    mut shutdown: ShutdownSignals,
 ) -> Result<MxcHandle> {
     let (in_tx, in_rx) = flume::unbounded::<Event>();
     std::thread::spawn(move || loop {
@@ -528,14 +689,21 @@ async fn run_ui(
         radio: radio_tx,
         libdone: libdone_tx,
     };
-    spawn_library_fetch(
-        app.svc.webapi.clone(),
-        chans.lib.clone(),
-        chans.libdone.clone(),
-    );
+    if app.svc.webapi.lock().is_ok_and(|api| api.is_available()) {
+        spawn_library_fetch(
+            app.svc.webapi.clone(),
+            chans.lib.clone(),
+            chans.libdone.clone(),
+        );
+    }
 
     // Re-enrich the restored last-played track (cover / theme / lyrics).
-    if let Some(uri) = app.session.restore_uri.take() {
+    if let Some(uri) = app
+        .session
+        .restore_uri
+        .take()
+        .filter(|_| !app.svc.engine.is_soloist())
+    {
         if let Some(id) = track_id_from_uri(&uri) {
             app.session.pending_meta = Some(format!("spotify:track:{id}"));
             let webapi = app.svc.webapi.clone();
@@ -590,6 +758,7 @@ async fn run_ui(
     loop {
         let touched = tokio::select! {
             biased;
+            signal = shutdown.recv() => { signal?; save_state(&app); break; },
             _ = frame.tick() => {
                 app.playback.flush_seek(&app.svc.engine, Instant::now());
                 // Drain library updates deterministically before rendering. Keeping
@@ -732,7 +901,8 @@ async fn run_ui(
                     // Refresh the live queue while playing so the snapshot stays
                     // current, then persist it (survives reboot).
                     if app.transport.playback_started {
-                        spawn_queue_fetch(app.svc.webapi.clone(), chans.queue.clone());
+                        if app.svc.engine.is_soloist() { let _ = app.svc.engine.request_queue(); }
+                        else { spawn_queue_fetch(app.svc.webapi.clone(), chans.queue.clone()); }
                     }
                     save_state(&app);
                 }
@@ -797,7 +967,7 @@ async fn run_ui(
                 // Don't let an empty live queue (e.g. a bare resumed track) wipe
                 // the restored/last-known snapshot.
                 if let Ok(q) = q {
-                    if !q.is_empty() {
+                    if !app.svc.engine.is_soloist() && !q.is_empty() {
                         app.transport.queue = q.iter().map(|(d, _)| d.clone()).collect();
                         app.transport.queue_uris = q.into_iter().map(|(_, u)| u).collect();
                     }
@@ -852,6 +1022,7 @@ async fn run_ui(
         };
         dirty |= touched;
     }
+    app.svc.engine.shutdown().context("stop playback backend")?;
     // Hand the publisher back to `main` so the `bye` goes out on the same path
     // that restores the terminal, rather than relying on where `App` happens
     // to be dropped.
@@ -892,16 +1063,15 @@ fn resume_source(app: &mut App, radio_tx: &flume::Sender<Result<Radio, String>>)
             }
         }
         PlaySource::Radio(seed) => {
-            let session = app.svc.engine.session();
+            if !app.svc.engine.capabilities().radio {
+                app.status = "radio is unavailable on this backend".to_string();
+                return;
+            }
+            let request = app.svc.engine.radio_tracks(seed);
             let tx = radio_tx.clone();
             app.status = "resuming radio…".to_string();
             tokio::spawn(async move {
-                let res = match tokio::time::timeout(
-                    Duration::from_secs(12),
-                    engine::radio_tracks(&session, &seed),
-                )
-                .await
-                {
+                let res = match tokio::time::timeout(Duration::from_secs(12), request).await {
                     Ok(r) => r.map_err(|e| e.to_string()),
                     Err(_) => Err("timed out (mercury radio endpoint unresponsive)".to_string()),
                 };

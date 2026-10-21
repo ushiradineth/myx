@@ -25,6 +25,8 @@ pub mod mxc;
 #[cfg(feature = "streaming")]
 pub mod audio;
 #[cfg(feature = "streaming")]
+pub mod cli;
+#[cfg(feature = "streaming")]
 pub mod config;
 #[cfg(feature = "streaming")]
 pub mod engine;

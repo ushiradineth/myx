@@ -176,6 +176,10 @@ impl App {
         }
         if item.is_track() {
             if self.search.searching {
+                if !self.svc.engine.capabilities().radio {
+                    self.play_context_row(item.uri, item.name, false);
+                    return Activated::None;
+                }
                 // A search-result song starts that song's radio (seed + similar).
                 self.transport.source = PlaySource::Radio(item.uri.clone());
                 self.transport.source_name = format!("Radio · {}", item.name);
@@ -183,6 +187,26 @@ impl App {
             }
             // Inside a drill-in → play its context at this track (real queue).
             if let Some(d) = self.browse.details.last() {
+                if self.svc.engine.is_soloist() {
+                    let tracks = d
+                        .items
+                        .iter()
+                        .filter(|row| row.is_track())
+                        .map(|row| row.uri.clone())
+                        .collect();
+                    self.transport.source = PlaySource::Context(d.context_uri.clone());
+                    self.transport.source_name = d.title.clone();
+                    self.status = format!("starting {}…", item.name);
+                    if let Err(error) = self.svc.engine.play_tracks(
+                        tracks,
+                        Some(item.uri),
+                        0,
+                        self.transport.shuffle,
+                    ) {
+                        self.status = format!("couldn't play: {error:#}");
+                    }
+                    return Activated::None;
+                }
                 let ctx = d.context_uri.clone();
                 self.transport.source = PlaySource::Context(ctx.clone());
                 self.transport.source_name = d.title.clone();

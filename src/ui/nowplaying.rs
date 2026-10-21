@@ -111,7 +111,16 @@ pub(crate) fn render_nowplaying_view(
         );
     }
 
-    render_visualizer(f, app, theme, viz_area);
+    if app.svc.engine.capabilities().local_dsp {
+        render_visualizer(f, app, theme, viz_area);
+    } else {
+        f.render_widget(
+            Paragraph::new("Soloist output · EQ / spectrum unavailable")
+                .style(theme.muted())
+                .alignment(Alignment::Center),
+            center_v(viz_area, 1),
+        );
+    }
 }
 
 /// Slim persistent bottom strip: play state + track, then the progress bar.

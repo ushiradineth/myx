@@ -70,6 +70,27 @@ pub(crate) fn scrub_target(from_ms: u32, duration_ms: u32, delta_ms: i64) -> u32
 }
 
 impl PlaybackState {
+    /// SDK text is available before cover HTTP finishes. Establish it now so
+    /// the next engine position/state event always has a model to update.
+    pub(crate) fn apply_sdk_metadata(&mut self, meta: &myx::engine::TrackMetadata) {
+        let position = self.position_ms();
+        let previous = self.now.take().filter(|now| now.uri == meta.uri);
+        let is_playing = previous.as_ref().is_some_and(|now| now.is_playing);
+        let position_ms = if previous.is_some() { position } else { 0 };
+        let cover = previous.and_then(|now| now.cover);
+        self.now = Some(NowPlaying {
+            uri: meta.uri.clone(),
+            title: meta.title.clone(),
+            artist: meta.artist.clone(),
+            album: meta.album.clone(),
+            duration_ms: meta.duration_ms,
+            position_ms,
+            position_at: Instant::now(),
+            is_playing,
+            cover,
+        });
+    }
+
     pub(crate) fn position_ms(&self) -> u32 {
         match &self.now {
             Some(n) if n.is_playing => {
@@ -196,5 +217,27 @@ mod tests {
         let mut playback = playing_at(0, Duration::ZERO);
         playback.now = None;
         assert!(!playback.freeze());
+    }
+
+    #[test]
+    fn sdk_metadata_exists_before_playback_events_and_cover_updates_keep_progress() {
+        let mut playback = playing_at(10_000, Duration::from_secs(1));
+        let meta = myx::engine::TrackMetadata {
+            uri: "spotify:track:new".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 200_000,
+            cover_url: None,
+        };
+        playback.apply_sdk_metadata(&meta);
+        assert!(!playback.now.as_ref().unwrap().is_playing);
+        assert_eq!(playback.position_ms(), 0);
+        playback.now.as_mut().unwrap().is_playing = true;
+        playback.set_local_position(4200, true);
+        playback.apply_sdk_metadata(&meta);
+        assert!(playback.now.as_ref().unwrap().is_playing);
+        assert!((4200..5000).contains(&playback.position_ms()));
+        assert_eq!(playback.now.as_ref().unwrap().title, "Song");
     }
 }

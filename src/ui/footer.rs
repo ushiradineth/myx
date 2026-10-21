@@ -44,12 +44,17 @@ pub(crate) fn render_footer(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
         ),
         (false, key("q"), lbl(" quit")),
     ];
-    let line = Line::from(
+    let mut spans = vec![Span::styled(
+        format!("{}   ", app.svc.engine.name()),
+        theme.muted(),
+    )];
+    spans.extend(
         hints
             .into_iter()
             .filter(|(needs_library, ..)| !needs_library || !app.view.zen)
-            .flat_map(|(_, k, label)| [k, label])
-            .collect::<Vec<_>>(),
+            .filter(|(_, k, _)| k.content != "e" || app.svc.engine.capabilities().local_dsp)
+            .flat_map(|(_, k, label)| [k, label]),
     );
+    let line = Line::from(spans);
     f.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }

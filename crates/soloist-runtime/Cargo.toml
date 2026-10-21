@@ -1,0 +1,17 @@
+[package]
+name = "soloist-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Owned macOS ARM64 Soloist runtime for Myx"
+
+[dependencies]
+anyhow = "1"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+libc = "0.2"
+libloading = "0.8"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"

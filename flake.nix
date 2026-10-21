@@ -28,7 +28,14 @@
             pname = "myx";
             version = "0.3.1";
 
-            src = lib.cleanSource ./.;
+            src = lib.cleanSourceWith {
+              src = ./.;
+              filter = path: type:
+                lib.cleanSourceFilter path type
+                && !lib.any
+                  (component: builtins.elem component [ ".runtime" ".cache" "target" "tools" ])
+                  (lib.splitString "/" (lib.removePrefix (toString ./. + "/") (toString path)));
+            };
             cargoLock.lockFile = ./Cargo.lock;
 
             nativeBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [

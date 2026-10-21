@@ -2819,10 +2819,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "soloist-runtime",
  "souvlaki",
+ "tempfile",
  "tokio",
  "toml",
  "tui-textarea-2",
+ "tungstenite",
  "vergen",
  "windows-win",
  "winit",
@@ -5034,6 +5037,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "soloist-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "libloading",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "souvlaki"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5548,6 +5563,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",

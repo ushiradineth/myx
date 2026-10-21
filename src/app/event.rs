@@ -14,6 +14,11 @@ pub(crate) fn handle_engine_event(
     match ev {
         EngineEvent::TrackChanged { uri } => {
             app.status = "loading track…".to_string();
+            if app.svc.engine.is_soloist() {
+                // SDK metadata arrives separately; no Web API credentials are needed.
+                app.session.pending_meta = Some(uri);
+                return;
+            }
             if let Some(track_id) = track_id_from_uri(&uri) {
                 // Record what we're waiting for so an earlier track's reply,
                 // landing late, is discarded instead of overwriting this one.
@@ -25,6 +30,48 @@ pub(crate) fn handle_engine_event(
                 });
             }
         }
+        EngineEvent::Metadata(meta) => {
+            if !meta_is_current(app.session.pending_meta.as_deref(), &meta.uri) {
+                return;
+            }
+            app.session.pending_meta = Some(meta.uri.clone());
+            // Establish the model synchronously, before the following Playing
+            // event. Cover HTTP must not lose the first playhead/paused update.
+            app.playback.apply_sdk_metadata(&meta);
+            let tx = meta_tx.clone();
+            let webapi = app.svc.webapi.clone();
+            // Keep image HTTP, decoding and palette extraction off the UI loop.
+            // Reuse apply_meta so SDK tracks retain cover, lyrics and theme updates.
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send(fetch_sdk_artwork(&webapi, meta));
+            });
+        }
+        EngineEvent::QueueChanged { entries } => {
+            // An empty SDK queue is authoritative too, not a failed API fetch.
+            let previous = app
+                .transport
+                .queue_uris
+                .iter()
+                .zip(&app.transport.queue)
+                .map(|(uri, title)| (uri.as_str(), title.as_str()));
+            let known_tracks = app
+                .browse
+                .details
+                .iter()
+                .flat_map(|detail| detail.items.iter())
+                .chain(app.search.search_results.iter())
+                .chain(
+                    Section::ALL
+                        .into_iter()
+                        .flat_map(|section| app.browse.library.items(section)),
+                )
+                .filter(|item| item.is_track())
+                .map(|item| (item.uri.as_str(), item.name.as_str()));
+            let (titles, uris) = queue_display(entries, previous.chain(known_tracks));
+            app.transport.queue = titles;
+            app.transport.queue_uris = uris;
+        }
+        EngineEvent::BackendStatus { message } => app.status = message,
         EngineEvent::Playing { position_ms, .. } => {
             if !app.transport.playback_started {
                 app.transport.playback_started = true;
@@ -55,6 +102,10 @@ pub(crate) fn handle_engine_event(
             }
         }
         EngineEvent::Stopped => {
+            if app.svc.engine.is_soloist() {
+                // Discard cover work still in flight for the stopped track.
+                app.session.pending_meta = Some(String::new());
+            }
             app.playback.now = None;
             app.transport.playback_started = false;
             // librespot cleared its context too, so only a fresh load can
@@ -114,6 +165,38 @@ pub(crate) fn handle_engine_event(
     }
 }
 
+fn queue_display<'a>(
+    entries: Vec<(String, String)>,
+    known: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> (Vec<String>, Vec<String>) {
+    if entries
+        .iter()
+        .all(|(title, uri)| !title.is_empty() && title != uri)
+    {
+        return entries.into_iter().unzip();
+    }
+    // Deferred SDK queue entries contain only URIs. Reuse Web API metadata
+    // already in memory, retaining previous labels after leaving a playlist.
+    // Only enrich labels: SDK order, duplicate tracks and URIs are authoritative.
+    let names: std::collections::HashMap<_, _> = known
+        .into_iter()
+        .filter(|(uri, title)| !title.is_empty() && title != uri)
+        .collect();
+    entries
+        .into_iter()
+        .map(|(mut title, uri)| {
+            if title.is_empty() || title == uri {
+                if let Some(known) = names.get(uri.as_str()) {
+                    title = (*known).to_owned();
+                } else if title.is_empty() {
+                    title.clone_from(&uri);
+                }
+            }
+            (title, uri)
+        })
+        .unzip()
+}
+
 /// Is this metadata reply the one we are still waiting for?
 ///
 /// `None` means nothing specific was requested (e.g. a path that predates the
@@ -140,7 +223,14 @@ pub(crate) fn apply_meta(
         .image
         .image
         .as_ref()
-        .map(|img| Cover::from_image(img.clone(), app.svc.picker.clone()));
+        .map(|img| Cover::from_image(img.clone(), app.svc.picker.clone()))
+        .or_else(|| {
+            app.playback
+                .now
+                .as_mut()
+                .filter(|now| now.uri == meta.uri)
+                .and_then(|now| now.cover.take())
+        });
     // A different cover encodes to a different symbol, so the diff emits it on
     // its own — no wipe, which would flash a blank box between the two covers.
     app.art_repaint = ArtRepaint::Draw;
@@ -282,5 +372,76 @@ pub(crate) fn play_selected_context(app: &mut App, shuffle: bool) {
     match context_target(&item) {
         Some((uri, name)) => app.play_context_row(uri, name, shuffle),
         None => app.status = "not a playlist, album, or artist".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod artwork_tests {
+    use super::meta_is_current;
+
+    #[test]
+    fn delayed_artwork_is_rejected_after_track_change_or_stop() {
+        let old_uri = "spotify:track:old";
+        assert!(meta_is_current(Some(old_uri), old_uri));
+        assert!(!meta_is_current(Some("spotify:track:new"), old_uri));
+        assert!(!meta_is_current(Some(""), old_uri));
+        assert!(meta_is_current(None, old_uri));
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::queue_display;
+
+    #[test]
+    fn pending_queue_tracks_reuse_known_titles_without_reordering_or_deduplication() {
+        let entries = vec![
+            ("SDK title".into(), "spotify:track:a".into()),
+            ("spotify:track:b".into(), "spotify:track:b".into()),
+            ("".into(), "spotify:track:c".into()),
+            ("spotify:track:b".into(), "spotify:track:b".into()),
+            ("spotify:track:d".into(), "spotify:track:d".into()),
+        ];
+        let (titles, uris) = queue_display(
+            entries,
+            [
+                ("spotify:track:a", "Library title"),
+                ("spotify:track:b", "Cached title"),
+                ("spotify:track:b", "Playlist title"),
+                ("spotify:track:c", "Search title"),
+                ("spotify:track:d", ""),
+            ],
+        );
+        assert_eq!(
+            titles,
+            [
+                "SDK title",
+                "Playlist title",
+                "Search title",
+                "Playlist title",
+                "spotify:track:d"
+            ]
+        );
+        assert_eq!(
+            uris,
+            [
+                "spotify:track:a",
+                "spotify:track:b",
+                "spotify:track:c",
+                "spotify:track:b",
+                "spotify:track:d"
+            ]
+        );
+        let (preserved, _) = queue_display(
+            vec![("spotify:track:b".into(), "spotify:track:b".into())],
+            uris.iter()
+                .zip(&titles)
+                .map(|(uri, title)| (uri.as_str(), title.as_str())),
+        );
+        assert_eq!(preserved, ["Playlist title"]);
+        assert_eq!(
+            queue_display(Vec::new(), [("spotify:track:a", "Known")]),
+            (Vec::new(), Vec::new())
+        );
     }
 }

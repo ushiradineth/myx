@@ -16,6 +16,11 @@ ten-band equalizer, and synced lyrics.
 > Requires **Spotify Premium**. Works on Linux, macOS, and Windows. Album art is
 > crispest on kitty, WezTerm, or foot.
 
+This fork also has an opt-in **Soloist** playback backend. Build the local Myx
+binary with `cargo build --release --features soloist`, then select it with
+`./target/release/myx --api soloist`. See [Playback backends](#production-playback-backends)
+for provisioning and capabilities. The normal backend remains the default.
+
 ## Install
 
 ```bash
@@ -41,7 +46,7 @@ or build from source: `cargo install --path .`.
 
 ## Get started
 
-You need a free Spotify app client ID (one minute):
+For the normal backend and Web API browsing, you need a free Spotify app client ID:
 
 1. [Spotify developer dashboard](https://developer.spotify.com/dashboard), then **Create app**
 2. Add the redirect URI `http://127.0.0.1:8989/login`
@@ -157,3 +162,132 @@ See [NOTICE](NOTICE).
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Production playback backends
+
+Myx defaults to the `normal` backend, with the existing librespot playback,
+equalizer, FFT visualizer and Mercury radio features. Build the optional Soloist
+backend into the same application with:
+
+```bash
+cargo build --release --features soloist
+target/release/myx --backend soloist
+```
+
+Set the default in `~/.config/myx/config.toml`:
+
+```toml
+backend = "normal" # or "soloist"; api is an alias for this config key
+
+[soloist]
+directory = "~/.config/myx/soloist" # optional; this is the default
+# api_key = "YOUR_SOLOIST_API_KEY" # inline alternative to api_key_file
+# api_key_file = "~/.config/myx/soloist/api-key" # default credential source
+# dsp = true # managed native EQ and spectrum; false explicitly bypasses the bridge
+# endpoint = "ws://127.0.0.1:12345" # attach to an externally managed SDK
+```
+
+Selection precedence is `--backend` / `--api`, then `MYX_BACKEND`, then the
+`backend` config key. For example, `target/release/myx --api soloist` overrides
+the environment and config. Backend selection is runtime configuration, including
+for future Windows backends; managed Soloist currently requires Apple Silicon
+and macOS 15 or newer. With `endpoint = "ws://127.0.0.1:PORT"` (replace `PORT`
+with the SDK's port), Myx attaches to that external process and never kills it.
+
+### Managed Soloist assets
+
+Keep the runtime outside the checkout, under `~/.config/myx/soloist` by default:
+
+```text
+soloist/
+  assets/soloist             # official ARM64 Linux SDK executable
+  assets/root/               # ARM64 Linux sysroot
+  assets/arm-libraries.json  # Nix library manifest
+  api-key                    # user-provisioned key, mode 0600
+  data/                      # paired session state, mode 0700
+  cache/                     # mode 0700
+  deps/elfuse/                # native runner store link
+  deps/audio/                 # native PulseAudio tools store link
+```
+
+Obtain the SDK and API key yourself through the
+[official Soloist documentation](https://developer.spotify.com/documentation/soloist).
+They are not redistributed here; the SDK's 90-day expiry still applies. Provision
+the executable and sysroot in `assets`, keep the key private, and set the data and
+cache directory permissions before launch. Paths can be overridden individually
+in `[soloist]`; use absolute paths or `~/` paths.
+
+To keep the key directly in Myx's config, set `[soloist].api_key` instead of
+`api_key_file`. Do not set both. An inline key does not require an `api-key` file;
+without either setting, Myx reads `api-key` from the Soloist directory. Keep
+`~/.config/myx/config.toml` private (`chmod 600`) when it contains a key, and never
+commit it. Key values are not included in Myx diagnostics. The SDK still requires
+the key in its process arguments, so do not share raw SDK process listings.
+
+For a fresh installation on a supported Mac, build the public dependencies from
+the repository root and register persistent store links:
+
+```bash
+soloist="$HOME/.config/myx/soloist"
+mkdir -p "$soloist/assets" "$soloist/deps" "$soloist/data" "$soloist/cache"
+chmod 700 "$soloist" "$soloist/data" "$soloist/cache"
+# After provisioning api-key from the official source:
+chmod 600 "$soloist/api-key"
+nix build --impure --builders '' -f ./nix/soloist.nix elfuse \
+  --out-link "$soloist/deps/elfuse"
+nix build --impure --builders '' -f ./nix/soloist.nix audio \
+  --out-link "$soloist/deps/audio"
+nix build --impure --builders '' -f ./nix/soloist.nix libraries \
+  --out-link "$soloist/assets/arm-libraries.json"
+```
+
+`nix/soloist.nix` exports `elfuse`, `audio`, `libraries` and optional `development`
+tools, pinned through the existing `flake.lock`. The immutable store name
+`myx-elfuse-packaging-trial` is retained for compatibility with the validated native
+derivation and existing GC roots; the production backend uses its patched runner.
+Existing migrated assets and registered roots can be reused without rebuilding.
+
+### Browsing, automation and limits
+
+Soloist URI playback does not need a Spotify Web API client ID. Myx does not
+prompt for one when Soloist is selected without `client_id`. Optional Web API
+browsing needs your own client ID and OAuth cache, as described above; use
+`--no-web-api` for URI-only playback. `--non-interactive` prevents an OAuth browser
+from opening.
+
+```bash
+target/release/myx --backend soloist --no-web-api \
+  spotify:track:4uLU6hMCjMI75M1A2tKUQC
+target/release/myx --backend soloist --no-web-api --non-interactive \
+  --headless --duration 30 spotify:track:4uLU6hMCjMI75M1A2tKUQC
+```
+
+For normal interactive use, keep Web API browsing enabled (the default):
+
+```bash
+target/release/myx --backend soloist
+```
+
+`--no-web-api` intentionally disables Home, Liked, playlists and search. It is an
+opt-out for URI-only playback, not the recommended interactive configuration.
+With existing Web API authorization, Soloist playback prefers the largest valid
+album image from the Web API and falls back to SDK artwork if unavailable.
+
+`--headless --duration SECONDS` runs the same playback engine for bounded track or
+episode automation, without a TUI. It confirms playback of the requested item,
+not merely a cached global playback state. Managed Soloist routes its private
+PulseAudio input through Myx's ten-band EQ and post-EQ FFT before CoreAudio output.
+Only Myx's audio is processed: this does not capture the microphone or system
+audio, install a virtual driver, or change the system default output. Streams use
+bounded stereo float32 PCM at 44.1 kHz. Pause/seek/stop flush queued PCM, and a
+bridge failure stops the owned runtime rather than silently bypassing EQ.
+`[soloist].dsp = false` explicitly restores direct output without EQ/spectrum.
+External WebSocket endpoints remain DSP-unavailable because Myx does not own
+their audio path. Native libpulse is loaded from the provisioned `deps/audio`;
+no global PulseAudio server is started or used. Headless managed playback reports
+processed-frame counts and estimated stream buffering, not acoustic latency.
+
+Soloist exposes native queue and metadata updates but not Mercury radio.
+Positioned context playback falls back to the selected
+track; the SDK cannot clear an existing queue, and list repeat is unsupported.
+These limits differ from the normal backend's playback behavior.

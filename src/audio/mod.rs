@@ -1,6 +1,8 @@
 //! Audio engine internals (streaming feature).
 
 pub mod equalizer;
+#[cfg(feature = "soloist")]
+pub(crate) mod managed;
 pub mod visualizer;
 
 pub use equalizer::{

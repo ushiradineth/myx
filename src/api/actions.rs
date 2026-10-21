@@ -14,6 +14,9 @@ pub(crate) fn spawn_action_menu(
     tx: flume::Sender<ActionMenu>,
 ) {
     tokio::task::spawn_blocking(move || {
+        if !webapi.lock().map(|w| w.is_available()).unwrap_or(false) {
+            return;
+        }
         if let Some(token) = token_of(&webapi) {
             let _ = tx.send(build_action_menu(Some(&token), &item));
         }
@@ -212,11 +215,34 @@ pub(crate) fn build_action_menu(token: Option<&str>, item: &LibItem) -> ActionMe
 }
 
 pub(crate) fn spawn_action(
+    engine: &Engine,
     webapi: Arc<Mutex<WebApi>>,
     kind: ActionKind,
     tx: flume::Sender<String>,
 ) {
+    if engine.is_soloist() {
+        if let ActionKind::Queue { uri } = kind {
+            // The Web API player endpoint targets the account's active device,
+            // which may not be this SDK player. Always use its own queue.
+            let msg = match engine.add_to_queue(uri) {
+                Ok(()) => match engine.request_queue() {
+                    Ok(()) => "added to queue".to_string(),
+                    Err(e) => format!("added to queue; refresh failed: {e}"),
+                },
+                Err(e) => format!("queue failed: {e}"),
+            };
+            let _ = tx.send(msg);
+            return;
+        }
+    }
     tokio::task::spawn_blocking(move || {
+        if !webapi.lock().map(|w| w.is_available()).unwrap_or(false) {
+            let _ = tx.send(
+                "Spotify Web API unavailable; this library action requires authorization"
+                    .to_string(),
+            );
+            return;
+        }
         let msg = match token_of(&webapi) {
             Some(t) => run_action(&t, kind),
             None => "not authorized".to_string(),

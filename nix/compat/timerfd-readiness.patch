@@ -1,0 +1,101 @@
+Subject: [PATCH] timerfd: reset rearm readiness and bound one-shot expirations
+Upstream: sysprog21/elfuse ba455f45592cd12488519e207c44c32fa8e167df
+License: Apache-2.0, matching the modified upstream source.
+
+Refresh the old inner-kqueue notification before installing a replacement,
+without draining an event belonging to the new timer. Preserve argument
+validation before mutation and leave periodic expiration accounting intact.
+Host replacement errors are returned with consistent disarmed metadata;
+transactional restoration after a host allocation failure is not added here.
+
+--- a/src/syscall/fd.c
++++ b/src/syscall/fd.c
+@@ -131,6 +131,18 @@
+     return sfd_alloc_slot(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]));
+ }
+-
++
++/* Called with sfd_lock held. EV_ONESHOT removes a native timer when its
++ * event is collected, but kev.data may count several ticks before collection.
++ * A Linux one-shot has exactly one expiration; periodic counts stay intact.
++ */
++static void timerfd_note_expirations_locked(int slot, uint64_t fires)
++{
++    if (timerfd_state[slot].interval_ns == 0)
++        timerfd_state[slot].expirations = 1;
++    else
++        timerfd_state[slot].expirations += fires;
++}
++
+ /* Called with sfd_lock held. Drain any kevent expirations sitting on the
+  * timer's kqueue and fold them into the slot's accumulator. Used by
+  * timerfd_read before consuming the counter and by timerfd_fdinfo_snapshot
+@@ -147,7 +159,7 @@
+         uint64_t fires = (uint64_t) kev.data;
+         if (fires == 0)
+             fires = 1; /* At least one expiration */
+-        timerfd_state[slot].expirations += fires;
++        timerfd_note_expirations_locked(slot, fires);
+     }
+ }
+-
++
+@@ -320,22 +332,32 @@
+         (long long) its.it_interval_sec, (long long) its.it_interval_nsec,
+         (long long) value_us, (long long) interval_ns, interval_ns == 0);
+-
++
+-    if (its.it_value_sec == 0 && its.it_value_nsec == 0) {
+-        /* Disarm timer */
+-        struct kevent kev;
+-        EV_SET(&kev, 1, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+-        kevent(kq, &kev, 1, NULL, 0, NULL); /* Ignore error if not armed */
+-
+-        /* Drain any stale pending events so the next timerfd_read() does not
+-         * see expirations from the now-disarmed timer.
+-         */
+-        struct timespec ts_zero = {0, 0};
+-        while (kevent(kq, NULL, 0, &kev, 1, &ts_zero) > 0)
+-            ;
+-
+-        timerfd_state[slot].armed = false;
+-        timerfd_state[slot].expirations = 0;
+-    } else {
++    /* Replacing a timer must discard the old native notification too.
++     * EV_ADD alone can leave the inner kqueue readable after a future rearm:
++     * epoll then reports EPOLLIN although timerfd_read would return EAGAIN.
++     * Remove the old source before draining, never collect the new timer here.
++     * Argument validation and old-value copying above precede any mutation.
++     */
++    struct kevent stale;
++    EV_SET(&stale, 1, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
++    if (kevent(kq, &stale, 1, NULL, 0, NULL) < 0 && errno != ENOENT) {
++        ret = linux_errno();
++        goto unlock;
++    }
++    /* A failed host replacement must not leave an apparently armed timer. */
++    timerfd_state[slot].armed = false;
++    timerfd_state[slot].expirations = 0;
++    struct timespec ts_zero = {0, 0};
++    int collected;
++    do {
++        collected = kevent(kq, NULL, 0, &stale, 1, &ts_zero);
++    } while (collected > 0 || (collected < 0 && errno == EINTR));
++    if (collected < 0) {
++        ret = linux_errno();
++        goto unlock;
++    }
++
++    if (its.it_value_sec != 0 || its.it_value_nsec != 0) {
+         /* Arm timer. Always use EV_ONESHOT: for repeating timers where initial
+          * value != interval, kqueue would repeat at the wrong period (initial
+          * instead of interval). timerfd_read re-arms with the interval after
+@@ -476,7 +498,7 @@
+                 uint64_t fires = (uint64_t) kev.data;
+                 if (fires == 0)
+                     fires = 1;
+-                timerfd_state[slot].expirations += fires;
++                timerfd_note_expirations_locked(slot, fires);
+             }
+         }
+     }

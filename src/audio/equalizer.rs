@@ -181,7 +181,7 @@ impl FilterState {
     }
 }
 
-struct FilterBank {
+pub(crate) struct FilterBank {
     settings: EqualizerSettings,
     coeffs: [Coefficients; NUM_EQ_BANDS],
     states: [[FilterState; NUM_EQ_BANDS]; 2],
@@ -192,7 +192,7 @@ struct FilterBank {
 }
 
 impl FilterBank {
-    fn new(settings: EqualizerSettings) -> Self {
+    pub(crate) fn new(settings: EqualizerSettings) -> Self {
         let settings = settings.normalized();
         let target_preamp = db_to_linear(settings.auto_preamp_db());
         Self {
@@ -206,7 +206,7 @@ impl FilterBank {
         }
     }
 
-    fn update(&mut self, settings: EqualizerSettings) {
+    pub(crate) fn update(&mut self, settings: EqualizerSettings) {
         let settings = settings.normalized();
         if settings == self.settings {
             return;
@@ -237,7 +237,7 @@ impl FilterBank {
         }
     }
 
-    fn process_interleaved(&mut self, samples: &mut [f64]) {
+    pub(crate) fn process_interleaved(&mut self, samples: &mut [f64]) {
         if !self.settings.enabled || self.settings.is_flat() {
             return;
         }
@@ -259,7 +259,7 @@ impl FilterBank {
         }
     }
 
-    fn reset_states(&mut self) {
+    pub(crate) fn reset_states(&mut self) {
         self.states = [[FilterState::default(); NUM_EQ_BANDS]; 2];
     }
 }

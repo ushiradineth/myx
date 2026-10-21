@@ -12,6 +12,11 @@ keywords = ["spotify", "tui", "music", "player", "ratatui"]
 categories = ["command-line-utilities", "multimedia::audio"]
 default-run = "myx"
 
+[workspace]
+members = ["crates/soloist-runtime"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 ratatui = "0.30.2"
 crossterm = "0.29.0"
@@ -24,7 +29,7 @@ color-thief = "0.2"
 librespot-core = { version = "0.8.0", optional = true }
 librespot-connect = { version = "0.8.0", optional = true }
 librespot-playback = { version = "0.8.0", optional = true, default-features = false, features = ["native-tls", "rodio-backend"] }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 flume = { version = "0.12", optional = true }
 rustfft = { version = "6", optional = true }
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["blocking", "json", "native-tls"] }
@@ -40,6 +45,8 @@ fs2 = { version = "0.4", optional = true }
 souvlaki = { version = "0.8.3", default-features = false, features = ["pollster", "zbus", "zvariant"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde"], optional = true }
 log = { version = "0.4.33", features = ["std"] }
+tungstenite = { version = "0.28", optional = true, default-features = false, features = ["handshake"] }
+soloist-runtime = { path = "crates/soloist-runtime", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-win = "3.0.0"
@@ -53,8 +60,14 @@ winit = "0.30.13"
 [build-dependencies]
 vergen = "=9.0.6"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["streaming", "mxc"]
+
+# Optional adapter. Selection is explicit in config/CLI; normal remains default.
+soloist = ["streaming", "dep:tungstenite", "dep:soloist-runtime"]
 
 # The Myx Color Protocol: pure data types + color math, usable without the
 # streaming backend so consumers can depend on the protocol half alone.
@@ -88,7 +101,7 @@ name = "myx"
 path = "src/main.rs"
 required-features = ["streaming"]
 
-# Dev tools, kept as examples (cargo run --example theme_demo / probe).
+# Public theme/protocol examples.
 [[example]]
 name = "theme_demo"
 path = "examples/theme_demo.rs"
@@ -97,11 +110,6 @@ path = "examples/theme_demo.rs"
 name = "mxc_demo"
 path = "examples/mxc_demo.rs"
 required-features = ["mxc"]
-
-[[example]]
-name = "probe"
-path = "examples/probe.rs"
-required-features = ["streaming"]
 
 [profile.release]
 lto = true

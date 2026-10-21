@@ -3,6 +3,14 @@
 use crate::*;
 
 pub(crate) fn handle_equalizer_key(app: &mut App, code: KeyCode) {
+    if !app.svc.engine.capabilities().local_dsp {
+        app.view.equalizer = None;
+        app.status = format!(
+            "{} does not support local PCM EQ/FFT",
+            app.svc.engine.name()
+        );
+        return;
+    }
     match code {
         KeyCode::Esc | KeyCode::Char('e') => app.view.equalizer = None,
         KeyCode::Left | KeyCode::Char('h') => move_band(app, -1),
@@ -27,6 +35,14 @@ pub(crate) fn handle_equalizer_mouse(
     out: &FrameOut,
     event: crossterm::event::MouseEvent,
 ) {
+    if !app.svc.engine.capabilities().local_dsp {
+        app.view.equalizer = None;
+        app.status = format!(
+            "{} does not support local PCM EQ/FFT",
+            app.svc.engine.name()
+        );
+        return;
+    }
     if !matches!(
         event.kind,
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)

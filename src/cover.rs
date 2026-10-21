@@ -173,7 +173,9 @@ impl Cover {
             match self.picker.new_protocol(
                 self.img.clone(),
                 Size::new(area.width, area.height),
-                Resize::Fit(None),
+                // SDK artwork can be thumbnail-sized. Fit only shrinks images;
+                // Scale also enlarges them while preserving the aspect ratio.
+                Resize::Scale(None),
             ) {
                 Ok(protocol) => *cached = Some((area, protocol)),
                 Err(_) => return false,
@@ -312,21 +314,71 @@ mod tests {
 
     #[test]
     fn cached_cover_can_be_replayed_without_a_blank_frame() {
-        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
-            4,
-            4,
-            image::Rgb([24, 120, 220]),
-        ));
-        let cover = Cover::from_image(img, Picker::halfblocks());
-        let mut output = Vec::new();
+        for striped in [false, true] {
+            let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |_, y| {
+                if striped && y % 2 == 1 {
+                    image::Rgb([220, 120, 24])
+                } else {
+                    image::Rgb([24, 120, 220])
+                }
+            }));
+            let cover = Cover::from_image(img, Picker::halfblocks());
+            let mut output = Vec::new();
 
-        cover
-            .render_direct(&mut output, Rect::new(3, 2, 4, 2))
-            .expect("direct cover render");
+            cover
+                .render_direct(&mut output, Rect::new(3, 2, 4, 2))
+                .expect("direct cover render");
 
-        assert!(!output.is_empty());
-        assert!(String::from_utf8_lossy(&output).contains('▀'));
-        assert!(!cover.needs_send(Rect::new(3, 2, 4, 2)));
+            assert!(!output.is_empty());
+            let output = String::from_utf8_lossy(&output);
+            if striped {
+                assert!(output.contains('▀') || output.contains('▄'));
+            } else {
+                // Identical pixel halves use colored spaces, not a half-block
+                // glyph. Check colors before backend ANSI/color-depth conversion.
+                assert!(output.contains(' '));
+                let area = Rect::new(3, 2, 4, 2);
+                let mut buffer = Buffer::empty(area);
+                let cached = cover.cached.borrow();
+                Image::new(&cached.as_ref().unwrap().1).render(area, &mut buffer);
+                for y in area.y..area.bottom() {
+                    for x in area.x..area.right() {
+                        assert_eq!(buffer[(x, y)].bg, ratatui::style::Color::Rgb(24, 120, 220));
+                    }
+                }
+            }
+            assert!(!cover.needs_send(Rect::new(3, 2, 4, 2)));
+        }
+    }
+
+    #[test]
+    fn small_covers_scale_to_the_artwork_area_in_every_protocol() {
+        for protocol in [
+            ProtocolType::Halfblocks,
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+            ProtocolType::Sixel,
+        ] {
+            // No terminal query: fix the cell geometry so the allocated area is
+            // 300x300 pixels, larger than the SDK's thumbnail-sized covers.
+            #[allow(deprecated)]
+            let mut picker = Picker::from_fontsize((10, 20).into());
+            picker.set_protocol_type(protocol);
+            for (width, height, expected) in [
+                (64, 64, Size::new(30, 15)),
+                (640, 640, Size::new(30, 15)),
+                (64, 32, Size::new(30, 8)),
+            ] {
+                let cover =
+                    Cover::from_image(DynamicImage::new_rgb8(width, height), picker.clone());
+                assert!(cover.ensure_cached(Rect::new(3, 2, 30, 15)));
+                assert_eq!(
+                    cover.cached.borrow().as_ref().unwrap().1.size(),
+                    expected,
+                    "{protocol:?}: {width}x{height} cover"
+                );
+            }
+        }
     }
 
     /// What one cover re-encode costs on the UI thread, per protocol. Ignored

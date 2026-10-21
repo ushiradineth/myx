@@ -1,0 +1,149 @@
+Subject: [PATCH] runtime: preserve absolute futex timeout clock domains
+Upstream: sysprog21/elfuse ba455f45592cd12488519e207c44c32fa8e167df
+License: Apache-2.0, matching the modified upstream source.
+
+Keep realtime PI deadlines and relative waits unchanged. Match the existing
+waitv monotonic-to-realtime conversion used for Darwin condition variables.
+The guest timespec is never rewritten. The shim's moved-word fast path does
+not park a waiter and needs no change.
+
+--- a/src/runtime/futex.c
++++ b/src/runtime/futex.c
+@@ -66,6 +66,13 @@
+ #define FUTEX_TRYLOCK_PI 8
+ #define FUTEX_WAIT_BITSET 9
+ #define FUTEX_WAKE_BITSET 10
++#define FUTEX_CLOCK_REALTIME_FLAG 0x100
++
++enum futex_deadline_mode {
++    FUTEX_DEADLINE_RELATIVE,
++    FUTEX_DEADLINE_REALTIME,
++    FUTEX_DEADLINE_MONOTONIC,
++};
+-
++
+ /* Strips the FUTEX_PRIVATE_FLAG (0x80) and FUTEX_CLOCK_REALTIME bits so the
+  * dispatch switch sees only the base operation. Emulation doesn't differentiate
+@@ -660,13 +667,15 @@
+-
++
+ /* Convert a Linux guest timespec to an absolute struct timespec deadline. For
+  * FUTEX_WAIT (relative timeout), adds the duration to the current time. For
+- * FUTEX_WAIT_BITSET (absolute timeout), uses the value directly.
++ * FUTEX_WAIT_BITSET preserves its absolute clock domain. Convert monotonic
++ * deadlines to the realtime clock used by Darwin condition variables; keep
++ * explicit realtime deadlines and the legacy PI path unchanged.
+  * Returns 0 on success, -1 if the guest pointer is invalid, -2 if the guest
+  * timespec is malformed.
+  */
+ static int futex_make_deadline(guest_t *g,
+                                uint64_t timeout_gva,
+-                               int is_absolute,
++                               enum futex_deadline_mode mode,
+                                struct timespec *out)
+ {
+     linux_timespec_t lts;
+@@ -675,7 +684,20 @@
+     if (!linux_timespec_is_valid(&lts))
+         return -2;
+-
++
+-    if (is_absolute) {
++    if (mode == FUTEX_DEADLINE_MONOTONIC) {
++        /* Match waitv's clock conversion without editing the guest timespec.
++         * Validation above bounds seconds arithmetic; normalize borrow/carry.
++         */
++        struct timeval now;
++        struct timespec mono;
++        gettimeofday(&now, NULL);
++        clock_gettime(CLOCK_MONOTONIC, &mono);
++        int64_t delta_sec = lts.tv_sec - mono.tv_sec;
++        long delta_nsec = (long) lts.tv_nsec - mono.tv_nsec;
++        out->tv_sec = now.tv_sec + delta_sec;
++        out->tv_nsec = (long) now.tv_usec * 1000 + delta_nsec;
++        timespec_normalize(out);
++    } else if (mode == FUTEX_DEADLINE_REALTIME) {
+         out->tv_sec = (time_t) lts.tv_sec;
+         out->tv_nsec = (long) lts.tv_nsec;
+     } else {
+@@ -811,7 +833,7 @@
+                                 uint32_t expected,
+                                 uint64_t timeout_gva,
+                                 uint32_t bitset,
+-                                int is_absolute)
++                                enum futex_deadline_mode mode)
+ {
+     if (bitset == 0)
+         return -LINUX_EINVAL;
+@@ -825,7 +847,7 @@
+     bool has_timeout = (timeout_gva != 0);
+     struct timespec deadline;
+     if (has_timeout) {
+-        int rc = futex_make_deadline(g, timeout_gva, is_absolute, &deadline);
++        int rc = futex_make_deadline(g, timeout_gva, mode, &deadline);
+         if (rc == -1)
+             return -LINUX_EFAULT;
+         if (rc == -2)
+@@ -1007,7 +1029,8 @@
+      * FUTEX_WAIT_BITSET is absolute and re-derives the same instant, so it
+      * stays restartable. See syscall_restart_forbid.
+      */
+-    if (ret == -LINUX_EINTR && has_timeout && !is_absolute)
++    if (ret == -LINUX_EINTR && has_timeout &&
++        mode == FUTEX_DEADLINE_RELATIVE)
+         syscall_restart_forbid();
+     return ret;
+ }
+@@ -1033,14 +1056,14 @@
+                           uint32_t expected,
+                           uint64_t timeout_gva,
+                           uint32_t bitset,
+-                          int is_absolute)
++                          enum futex_deadline_mode mode)
+ {
+     unsigned idx = futex_hash(uaddr);
+     unsigned pub = idx;
+-
++
+     shim_globals_futex_waiters_add(g, idx, +1);
+     int64_t rc = futex_wait_inner(&pub, g, uaddr, expected, timeout_gva, bitset,
+-                                  is_absolute);
++                                  mode);
+     shim_globals_futex_waiters_add(g, pub, -1);
+     return rc;
+ }
+@@ -1524,8 +1547,8 @@
+     bool has_timeout = (timeout_gva != 0);
+     struct timespec deadline;
+     if (has_timeout) {
+-        int rc =
+-            futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, &deadline);
++        int rc = futex_make_deadline(g, timeout_gva,
++                                    FUTEX_DEADLINE_REALTIME, &deadline);
+         if (rc == -1)
+             return -LINUX_EFAULT;
+         if (rc == -2)
+@@ -1851,7 +1874,7 @@
+          * signal it could not claim. waiter.woken is what tells them apart.
+          */
+         return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
+-                          /*is_absolute=*/0);
++                          FUTEX_DEADLINE_RELATIVE);
+-
++
+     case FUTEX_WAKE:
+         return futex_wake(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+@@ -1872,7 +1895,10 @@
+                              val3);
+-
++
+     case FUTEX_WAIT_BITSET:
+-        return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
++        return futex_wait(g, uaddr, val, timeout_gva, val3,
++                          (op & FUTEX_CLOCK_REALTIME_FLAG)
++                              ? FUTEX_DEADLINE_REALTIME
++                              : FUTEX_DEADLINE_MONOTONIC);
+-
++
+     case FUTEX_WAKE_BITSET:
+         return futex_wake(g, uaddr, val, val3);
