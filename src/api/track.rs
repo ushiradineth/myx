@@ -3,54 +3,6 @@
 use super::*;
 use crate::*;
 
-pub(crate) fn fetch_track_meta(webapi: &Arc<Mutex<WebApi>>, track_id: &str) -> TrackMeta {
-    let uri = format!("spotify:track:{track_id}");
-    let empty = || TrackMeta {
-        uri: uri.clone(),
-        title: String::new(),
-        artist: String::new(),
-        album: String::new(),
-        duration_ms: 0,
-        image: TrackImage {
-            image: None,
-            url: None,
-        },
-        theme: None,
-    };
-    let Some(token) = token_of(webapi) else {
-        return empty();
-    };
-    let client = http_client();
-    let Some(v) = get_json_cached(&client, &format!("{API}/tracks/{track_id}"), &token) else {
-        return empty();
-    };
-
-    let title = v["name"].as_str().unwrap_or("").to_string();
-    let artist = v["artists"][0]["name"].as_str().unwrap_or("").to_string();
-    let album = v["album"]["name"].as_str().unwrap_or("").to_string();
-    let duration_ms = v["duration_ms"].as_u64().unwrap_or(0) as u32;
-    let cover_url = largest_cover_url(&v["album"]["images"]).map(String::from);
-
-    let image = cover_url
-        .clone()
-        .and_then(|u| fetch_cover(&client, &u))
-        .and_then(|bytes| image::load_from_memory(&bytes).ok());
-    let theme = image.as_ref().map(|img| derive_theme(img, "album ✦"));
-
-    TrackMeta {
-        uri,
-        title,
-        artist,
-        album,
-        duration_ms,
-        image: TrackImage {
-            image,
-            url: cover_url,
-        },
-        theme,
-    }
-}
-
 /// Prefer known pixel area over unknown dimensions, keeping API order on ties.
 /// A valid URL with missing/bad dimensions is still useful as a last resort.
 fn largest_cover_url(images: &serde_json::Value) -> Option<&str> {
@@ -80,18 +32,15 @@ fn largest_cover_url(images: &serde_json::Value) -> Option<&str> {
     best.map(|(url, _)| url)
 }
 
-/// Optional artwork enrichment only: SDK text remains authoritative, and this
-/// path never initializes Web API authorization. Run on the blocking worker.
-pub(crate) fn fetch_sdk_artwork(
-    webapi: &Arc<Mutex<WebApi>>,
-    meta: myx::engine::TrackMetadata,
-) -> TrackMeta {
+/// Viewer artwork enrichment only. Observed text stays intact, catalog requests
+/// use the daemon, and image downloads/decoding run on the blocking worker.
+pub(crate) fn fetch_sdk_artwork(webapi: &Arc<Mutex<WebApi>>, meta: TrackMetadata) -> TrackMeta {
     let client = http_client();
     // There is no episode metadata fetch in the existing API layer. Episodes
     // (and other SDK URI kinds) keep their SDK cover instead of guessing an API.
     let preferred = track_id_from_uri(&meta.uri)
         .and_then(|id| {
-            let token = token_of(webapi)?;
+            let token = connection_of(webapi)?;
             get_json_cached(&client, &format!("{API}/tracks/{id}"), &token)
         })
         .and_then(|v| largest_cover_url(&v["album"]["images"]).map(String::from));
@@ -114,7 +63,7 @@ pub(crate) fn fetch_sdk_artwork(
 }
 
 fn sdk_artwork_meta(
-    meta: myx::engine::TrackMetadata,
+    meta: TrackMetadata,
     preferred: Option<&str>,
     mut fetch: impl FnMut(&str) -> Option<Vec<u8>>,
 ) -> Option<TrackMeta> {
@@ -149,8 +98,8 @@ mod artwork_tests {
     use super::*;
     use serde_json::json;
 
-    fn sdk_meta() -> myx::engine::TrackMetadata {
-        myx::engine::TrackMetadata {
+    fn sdk_meta() -> TrackMetadata {
+        TrackMetadata {
             uri: "spotify:track:test".into(),
             title: "SDK title".into(),
             artist: "SDK artist".into(),

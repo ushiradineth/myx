@@ -1,77 +1,63 @@
-//! librespot's `log` bridge and the optional `MYX_LOG` debug file.
+//! Optional bounded application diagnostics. Provider HTTP/token logs are not forwarded.
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::sync::Mutex;
 
-/// Temporary-but-useful diagnostics for startup/library failures. Kept out of
-/// the TUI because alternate-screen rendering hides stderr.
-/// Forwards librespot's own `log` output into `myx.log`. Its Connect
-/// diagnostics are the only account of why the device went inactive, and
-/// without a logger installed they go nowhere.
-pub struct LibrespotLog;
-
-impl log::Log for LibrespotLog {
-    fn enabled(&self, _: &log::Metadata) -> bool {
-        true
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+struct AppLog;
+impl log::Log for AppLog {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target().starts_with("myx")
     }
-    fn log(&self, record: &log::Record) {
-        liblog(format!(
-            "{} {}: {}",
-            record.level(),
-            record.target(),
-            record.args()
-        ));
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            liblog(format!("{}: {}", record.level(), record.args()));
+        }
     }
     fn flush(&self) {}
 }
 
-/// Any value of `MYX_LOG` turns logging on; the value only picks how loud
-/// librespot is. `debug`/`trace` open it up, `warn` quiets it back down.
-pub fn install_librespot_log() {
-    let Ok(level) = std::env::var("MYX_LOG") else {
-        return;
-    };
-    let filter = match level.to_ascii_lowercase().as_str() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "warn" => log::LevelFilter::Warn,
-        // Connect names its own faults at info ("device became inactive");
-        // warn shows only the fallout.
-        _ => log::LevelFilter::Info,
-    };
-    if log::set_boxed_logger(Box::new(LibrespotLog)).is_ok() {
-        log::set_max_level(filter);
+pub fn install_logger() {
+    if std::env::var_os("MYX_LOG").is_some() && log::set_boxed_logger(Box::new(AppLog)).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
     }
 }
 
-/// Optional debug log — silent unless `MYX_LOG` is set. Writes to
-/// ~/.cache/myx/myx.log (user-owned dir 0700, file 0600) instead of a
-/// world-writable fixed /tmp path (audit H5).
-pub fn liblog(msg: impl AsRef<str>) {
-    use std::io::Write;
+pub fn liblog(message: impl AsRef<str>) {
     if std::env::var_os("MYX_LOG").is_none() {
         return;
     }
+    let Ok(_guard) = LOG_LOCK.try_lock() else {
+        return;
+    };
     let Some(home) = crate::home_dir() else {
         return;
     };
-    let dir = home.join(".cache/myx");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
+    let directory = home.join(".cache/myx");
+    if crate::ipc::unix::private_directory(&directory).is_err() {
+        return;
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(directory.join("myx.log"))
+    else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() >= 2 * 1024 * 1024
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        return;
     }
-    if let Ok(mut f) = opts.open(dir.join("myx.log")) {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        let _ = writeln!(f, "{ts:.3} {}", msg.as_ref());
-    }
+    let mut line = message.as_ref().chars().take(1024).collect::<String>();
+    line.retain(|character| !character.is_control() || character == '\t');
+    let _ = writeln!(file, "{} {line}", crate::domain::playback::now_ms());
 }

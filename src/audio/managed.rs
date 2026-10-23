@@ -1,28 +1,33 @@
-//! Reuse normal playback's EQ and FFT on managed Soloist's native PCM frames.
+//! EQ and demand-driven FFT on managed Soloist's native PCM frames.
 use super::{
     equalizer::{EqualizerControl, FilterBank},
     visualizer::{SpectrumAnalyzer, VisBands},
 };
 use soloist_runtime::pcm::{AudioProcessor, BLOCK_SAMPLES, CHANNELS, SAMPLE_RATE};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct ManagedProcessor {
     settings: EqualizerControl,
     filters: FilterBank,
     spectrum: SpectrumAnalyzer,
-    bands: Arc<Mutex<VisBands>>,
+    spectrum_enabled: Arc<AtomicBool>,
     scratch: [f64; BLOCK_SAMPLES],
 }
 impl ManagedProcessor {
-    pub(crate) fn new(settings: EqualizerControl, bands: Arc<Mutex<VisBands>>) -> Self {
+    pub(crate) fn new(
+        settings: EqualizerControl,
+        bands: Arc<Mutex<VisBands>>,
+        spectrum_enabled: Arc<AtomicBool>,
+    ) -> Self {
         let initial = *settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self {
             filters: FilterBank::new(initial),
             settings,
-            spectrum: SpectrumAnalyzer::new(bands.clone(), SAMPLE_RATE as f32),
-            bands,
+            spectrum: SpectrumAnalyzer::new(bands, SAMPLE_RATE as f32),
+            spectrum_enabled,
             scratch: [0.0; BLOCK_SAMPLES],
         }
     }
@@ -38,12 +43,13 @@ impl AudioProcessor for ManagedProcessor {
             *out = f64::from(*input);
         }
         self.filters.process_interleaved(scratch);
-        self.spectrum.process(scratch);
+        if self.spectrum_enabled.load(Ordering::Acquire) {
+            self.spectrum.process(scratch, &self.spectrum_enabled);
+        } else {
+            self.spectrum.reset();
+        }
         for (out, input) in samples.iter_mut().zip(scratch.iter()) {
             *out = *input as f32;
-        }
-        if let Ok(mut bands) = self.bands.try_lock() {
-            bands.is_active = true;
         }
     }
     fn reset(&mut self) {
@@ -60,7 +66,11 @@ mod tests {
     fn bypass_is_exact_and_stereo_isolated_with_live_post_eq_spectrum() {
         let settings = shared_equalizer();
         let bands = VisBands::shared();
-        let mut processor = ManagedProcessor::new(settings.clone(), bands.clone());
+        let mut processor = ManagedProcessor::new(
+            settings.clone(),
+            bands.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
         let mut samples = [0.0; BLOCK_SAMPLES];
         for (i, frame) in samples.chunks_exact_mut(2).enumerate() {
             frame[0] = (i as f32 * 0.1).sin() * 0.1;
@@ -83,5 +93,54 @@ mod tests {
         let bands = bands.lock().unwrap();
         assert!(!bands.is_active);
         assert!(bands.values.iter().all(|band| *band == 0.0));
+    }
+
+    #[test]
+    fn spectrum_demand_defaults_off_and_detachment_clears_bands_without_bypassing_eq() {
+        let settings = shared_equalizer();
+        settings.lock().unwrap().gains_db[5] = 6;
+        let bands = VisBands::shared();
+        let enabled = Arc::new(AtomicBool::new(false));
+        let mut processor = ManagedProcessor::new(settings, bands.clone(), enabled.clone());
+        let mut input = [0.0; BLOCK_SAMPLES];
+        for (i, frame) in input.chunks_exact_mut(CHANNELS).enumerate() {
+            frame[0] = (i as f32 * 0.1).sin() * 0.1;
+        }
+        let initial_update = bands.lock().unwrap().updated_at;
+        let mut samples = input;
+        processor.process(&mut samples);
+        assert_ne!(
+            samples, input,
+            "EQ still processes audio without spectrum demand"
+        );
+        assert_eq!(processor.spectrum.fft_frames(), 0);
+        assert!(!bands.lock().unwrap().is_active);
+        assert!(bands
+            .lock()
+            .unwrap()
+            .values
+            .iter()
+            .all(|value| *value == 0.0));
+        enabled.store(true, Ordering::Release);
+        for _ in 0..8 {
+            samples = input;
+            processor.process(&mut samples);
+        }
+        assert!(bands.lock().unwrap().is_active);
+        assert!(bands
+            .lock()
+            .unwrap()
+            .values
+            .iter()
+            .any(|value| *value > 0.0));
+        let fft_frames = processor.spectrum.fft_frames();
+        assert!(fft_frames > 0);
+        enabled.store(false, Ordering::Release);
+        processor.process(&mut samples);
+        assert_eq!(processor.spectrum.fft_frames(), fft_frames);
+        let bands = bands.lock().unwrap();
+        assert!(!bands.is_active);
+        assert!(bands.values.iter().all(|value| *value == 0.0));
+        assert!(bands.updated_at >= initial_update);
     }
 }

@@ -1,4 +1,4 @@
-//! Opt-in Soloist adapter. Only the worker touches the runtime or the socket.
+//! Managed Soloist transport. Only the worker touches the runtime or the socket.
 //! Protocol: https://developer.spotify.com/documentation/soloist/reference/websocket-api
 
 use std::collections::VecDeque;
@@ -14,9 +14,10 @@ use rand::seq::SliceRandom;
 use serde_json::{json, Value};
 use tungstenite::{protocol::WebSocketConfig, Message, WebSocket};
 
-use super::{EngineEvent, TrackMetadata};
+use super::protocol::{ObservedMetadata as TrackMetadata, PlayerEvent as EngineEvent};
 use crate::audio::VisBands;
 use crate::config::SoloistConfig;
+use crate::domain::RepeatMode;
 
 const WAITING: u8 = 0;
 const READY: u8 = 1;
@@ -28,10 +29,13 @@ const POLL: Duration = Duration::from_secs(5);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const SEEK_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub struct Engine {
+pub struct RuntimePlayer {
     pub bands: Arc<Mutex<VisBands>>,
+    spectrum_enabled: Arc<AtomicBool>,
+    device_id: Arc<Mutex<Option<String>>>,
     equalizer: crate::audio::equalizer::EqualizerControl,
     audio: soloist_runtime::pcm::AudioControl,
+    playback_gate: PlaybackGate,
     commands: flume::Sender<Command>,
     stopping: Arc<AtomicBool>,
     stop_pending: Arc<AtomicBool>,
@@ -50,7 +54,7 @@ enum Command {
     Next,
     Prev,
     Shuffle(bool),
-    Repeat(bool),
+    Repeat(RepeatMode),
     Volume(u8),
     Seek(u32),
     Add(String),
@@ -145,11 +149,73 @@ impl Intents {
     }
 }
 
+/// Serializes owner verification and SDK audibility before publishing to PCM.
+/// Neither observation alone authorizes audible output.
+#[derive(Clone)]
+struct PlaybackGate {
+    control: soloist_runtime::pcm::AudioControl,
+    state: Arc<Mutex<PlaybackGateState>>,
+}
+
+#[derive(Default)]
+struct PlaybackGateState {
+    verified: bool,
+    audible: bool,
+    #[cfg(test)]
+    applied_active: bool,
+}
+
+impl PlaybackGate {
+    fn new(control: soloist_runtime::pcm::AudioControl) -> Self {
+        control.set_active(false);
+        Self {
+            control,
+            state: Arc::new(Mutex::new(PlaybackGateState::default())),
+        }
+    }
+
+    fn set_active(&self, active: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.audible = active;
+        self.apply(&mut state);
+    }
+
+    fn set_verified(&self, verified: bool, stopping: &AtomicBool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Check cancellation under the publication lock so an owner update
+        // racing shutdown cannot restore verification after revocation.
+        state.verified = verified && !stopping.load(Ordering::Acquire);
+        self.apply(&mut state);
+    }
+
+    fn apply(&self, state: &mut PlaybackGateState) {
+        let active = state.verified && state.audible;
+        self.control.set_active(active);
+        #[cfg(test)]
+        {
+            // Observe the exact activation value published to the private PCM
+            // control without exposing its internals or starting native audio.
+            state.applied_active = active;
+        }
+    }
+
+    fn reset(&self) {
+        self.control.reset();
+    }
+}
+
 struct WorkerControl<'a> {
     stop: &'a AtomicBool,
     stop_pending: &'a AtomicBool,
     phase: &'a AtomicU8,
-    audio: &'a soloist_runtime::pcm::AudioControl,
+    audio: &'a PlaybackGate,
+    device_id: &'a Mutex<Option<String>>,
 }
 
 // Cancelling asynchronous startup must still stop a worker in Runtime::start.
@@ -166,19 +232,25 @@ impl Drop for StartupGuard {
     }
 }
 
-impl Engine {
-    pub async fn start(tx: flume::Sender<EngineEvent>, volume: u8) -> Result<Self> {
-        let config = crate::config::get().soloist.clone();
+impl RuntimePlayer {
+    pub async fn start(
+        config: SoloistConfig,
+        tx: flume::Sender<super::protocol::PlayerEvent>,
+        volume: u8,
+    ) -> Result<Self> {
         let bands = VisBands::shared();
+        let spectrum_enabled = Arc::new(AtomicBool::new(false));
+        let device_id = Arc::new(Mutex::new(None));
+        let worker_device_id = device_id.clone();
         let equalizer = crate::audio::equalizer::shared_equalizer();
         let audio = soloist_runtime::pcm::AudioControl::default();
-        let worker_audio = audio.clone();
-        let processor = (config.endpoint.is_none() && config.dsp).then(|| {
-            Box::new(crate::audio::managed::ManagedProcessor::new(
-                equalizer.clone(),
-                bands.clone(),
-            )) as Box<dyn soloist_runtime::pcm::AudioProcessor>
-        });
+        let playback_gate = PlaybackGate::new(audio.clone());
+        let worker_audio = playback_gate.clone();
+        let processor = Box::new(crate::audio::managed::ManagedProcessor::new(
+            equalizer.clone(),
+            bands.clone(),
+            spectrum_enabled.clone(),
+        )) as Box<dyn soloist_runtime::pcm::AudioProcessor>;
         let (commands, rx) = flume::bounded(MAILBOX_CAPACITY);
         let (started, ready) = tokio::sync::oneshot::channel();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -201,11 +273,22 @@ impl Engine {
                         stop_pending: &worker_stop_pending,
                         phase: &worker_phase,
                         audio: &worker_audio,
+                        device_id: &worker_device_id,
                     },
                     &mut started,
                     processor,
                 );
                 worker_audio.set_active(false);
+                *worker_device_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                emit(
+                    &tx,
+                    EngineEvent::Authentication {
+                        logged_in: false,
+                        is_active: false,
+                    },
+                );
                 worker_phase.store(STOPPED, Ordering::Release);
                 if let Some(started) = started.take() {
                     let _ = started.send(Err(anyhow!(
@@ -235,8 +318,11 @@ impl Engine {
         let worker = guard.worker.take().expect("startup worker owned");
         Ok(Self {
             bands,
+            spectrum_enabled,
+            device_id,
             equalizer,
             audio,
+            playback_gate,
             commands,
             stopping,
             stop_pending,
@@ -247,6 +333,22 @@ impl Engine {
 
     pub fn has_local_dsp(&self) -> bool {
         self.audio.is_ready()
+    }
+    /// Authorize PCM only after the owner verifies this SDK device and service.
+    /// SDK availability and playback/auth observations remain independent.
+    pub fn set_verified(&self, verified: bool) {
+        self.playback_gate.set_verified(verified, &self.stopping);
+    }
+    /// The owner enables telemetry only while a spectrum subscriber is attached.
+    pub fn set_spectrum_enabled(&self, enabled: bool) {
+        self.spectrum_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            let mut bands = self
+                .bands
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *bands = VisBands::new();
+        }
     }
     pub fn audio_stats(&self) -> Option<soloist_runtime::pcm::AudioStats> {
         self.has_local_dsp().then(|| self.audio.stats())
@@ -344,8 +446,8 @@ impl Engine {
     pub fn shuffle(&self, on: bool) -> Result<()> {
         self.submit(Command::Shuffle(on))
     }
-    pub fn repeat(&self, on: bool) -> Result<()> {
-        self.submit(Command::Repeat(on))
+    pub fn set_repeat(&self, mode: RepeatMode) -> Result<()> {
+        self.submit(Command::Repeat(mode))
     }
     pub fn set_volume(&self, volume: u16) -> Result<()> {
         self.submit(Command::Volume(volume_percent(volume)))
@@ -361,9 +463,15 @@ impl Engine {
         self.submit(Command::Queue)
     }
 
-    // The WebSocket API does not expose a documented Connect device ID.
+    /// Validated public discovery identity of this owned SDK instance.
     pub fn device_id(&self) -> Result<String> {
-        bail!("Soloist does not expose a Connect device ID through its WebSocket API")
+        ensure!(!self.stopping.load(Ordering::Acquire), "Soloist is stopped");
+        self.device_id
+            .lock()
+            .map_err(|_| anyhow!("Soloist identity lock failed"))?
+            .clone()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow!("Soloist owned SDK device identity is unavailable"))
     }
 
     /// The SDK has pause, not a destructive stop command. Keep the backend
@@ -379,6 +487,8 @@ impl Engine {
     /// Blocking ownership barrier. Call off the UI thread during app shutdown.
     pub fn shutdown(&self) -> Result<()> {
         self.stopping.store(true, Ordering::Release);
+        self.set_verified(false);
+        self.playback_gate.set_active(false);
         let mut worker = self
             .worker
             .lock()
@@ -392,11 +502,13 @@ impl Engine {
     }
 }
 
-impl Drop for Engine {
+impl Drop for RuntimePlayer {
     fn drop(&mut self) {
         // The worker observes cancellation and drops its owned runtime even if
         // the caller cannot perform the explicit blocking shutdown barrier.
         self.stopping.store(true, Ordering::Release);
+        self.set_verified(false);
+        self.playback_gate.set_active(false);
         if let Ok(worker) = self.worker.get_mut() {
             if let Some(worker) = worker.take() {
                 let _ = worker.join();
@@ -592,6 +704,34 @@ fn status(tx: &flume::Sender<EngineEvent>, message: &'static str) {
             message: message.into(),
         },
     );
+}
+
+fn observe_authentication(
+    value: &Value,
+    logged_in: bool,
+    is_active: bool,
+    tx: &flume::Sender<EngineEvent>,
+) {
+    if matches!(
+        value["type"].as_str(),
+        Some(
+            "auth_state"
+                | "playback_state"
+                | "track_changed"
+                | "playback_changed"
+                | "device_changed"
+                | "context_changed"
+                | "position_sync"
+        )
+    ) {
+        emit(
+            tx,
+            EngineEvent::Authentication {
+                logged_in,
+                is_active: logged_in && is_active,
+            },
+        );
+    }
 }
 
 #[derive(Default)]
@@ -808,24 +948,33 @@ struct Session {
     explicit: bool,
     target: Option<String>,
     seek: Option<DeferredSeek>,
-    repeat: bool,
+    repeat: RepeatMode,
     queue: Vec<(String, String)>,
     loaded_locally: bool,
 }
 
 impl Session {
     fn context_repeat(&self) -> bool {
-        self.repeat && !self.explicit
+        self.repeat == RepeatMode::All && !self.explicit
+    }
+
+    fn repeat_commands(&self) -> [Value; 2] {
+        [
+            field_command(
+                "set_repeat_track",
+                "enabled",
+                self.repeat == RepeatMode::One,
+            ),
+            field_command("set_repeat_context", "enabled", self.context_repeat()),
+        ]
     }
 
     fn options(&self, peer: &mut Peer, shuffle: bool) -> Result<()> {
         peer.send(field_command("set_shuffle", "enabled", shuffle))?;
-        peer.send(field_command("set_repeat_track", "enabled", false))?;
-        peer.send(field_command(
-            "set_repeat_context",
-            "enabled",
-            self.context_repeat(),
-        ))
+        for command in self.repeat_commands() {
+            peer.send(command)?;
+        }
+        Ok(())
     }
 
     fn cancel_pending(&mut self) {
@@ -905,7 +1054,7 @@ impl Session {
                 self.pending = tracks;
                 self.sent.clear();
                 self.explicit = true;
-                if self.repeat {
+                if self.repeat == RepeatMode::All {
                     status(tx, "Soloist cannot repeat explicit track lists; list repeat is disabled, and the context repeat preference is retained");
                 }
                 if !self.pending.is_empty() || !self.queue.is_empty() {
@@ -953,18 +1102,15 @@ impl Session {
             Command::Volume(volume) => {
                 peer.send(field_command("set_volume", "volume", volume))?;
             }
-            Command::Repeat(on) => {
-                self.repeat = on;
-                if on && self.explicit {
+            Command::Repeat(mode) => {
+                self.repeat = mode;
+                if mode == RepeatMode::All && self.explicit {
                     status(tx, "Soloist cannot repeat explicit track lists; list repeat is disabled, and the context repeat preference is retained");
                 }
                 peer.command("activate")?;
-                peer.send(field_command("set_repeat_track", "enabled", false))?;
-                peer.send(field_command(
-                    "set_repeat_context",
-                    "enabled",
-                    self.context_repeat(),
-                ))?;
+                for command in self.repeat_commands() {
+                    peer.send(command)?;
+                }
             }
             Command::Shuffle(on) => {
                 peer.command("activate")?;
@@ -1045,6 +1191,7 @@ impl Session {
             return Ok(());
         }
         let changed = self.playback.update(value, tx);
+        observe_authentication(value, true, self.playback.active, tx);
         if changed || value["type"] == "track_changed" {
             if let Some(uri) = self.playback.metadata.as_ref().map(|m| &m.uri) {
                 if let Some(index) = self.sent.iter().position(|queued| queued == uri) {
@@ -1153,42 +1300,32 @@ fn run(
     tx: &flume::Sender<EngineEvent>,
     control: &WorkerControl<'_>,
     started: &mut Option<tokio::sync::oneshot::Sender<Result<()>>>,
-    processor: Option<Box<dyn soloist_runtime::pcm::AudioProcessor>>,
+    processor: Box<dyn soloist_runtime::pcm::AudioProcessor>,
 ) -> Result<()> {
-    let mut runtime = None;
-    let endpoint = if let Some(endpoint) = &config.endpoint {
-        endpoint_address(endpoint)?;
-        endpoint.clone()
-    } else {
-        ensure!(
-            cfg!(all(target_os = "macos", target_arch = "aarch64")),
-            "Managed Soloist requires macOS ARM64; configure a loopback endpoint on this platform"
-        );
-        let runtime_config = runtime_config(&config, volume)
-            .map_err(|_| anyhow!("Soloist runtime configuration is invalid or incomplete"))?;
-        let owned = match processor {
-            Some(processor) => soloist_runtime::Runtime::start_processed(
-                runtime_config,
-                control.audio.clone(),
-                processor,
-            ),
-            None => soloist_runtime::Runtime::start(runtime_config),
-        }
-        .map_err(|_| {
-            anyhow!("Soloist managed runtime failed to start; check provisioned assets")
-        })?;
-        let endpoint = owned.endpoint();
-        runtime = Some(owned);
-        endpoint
-    };
+    ensure!(
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        "Managed Soloist requires macOS ARM64"
+    );
+    let runtime_config = runtime_config(&config, volume)
+        .map_err(|_| anyhow!("Soloist runtime configuration is invalid or incomplete"))?;
+    let owned = soloist_runtime::Runtime::start_processed(
+        runtime_config,
+        control.audio.control.clone(),
+        processor,
+    )
+    .map_err(|_| anyhow!("Soloist managed runtime failed to start; check provisioned assets"))?;
+    let endpoint = owned.endpoint();
+    // Retain only the validated public discovery ID, never the pairing body.
+    *control
+        .device_id
+        .lock()
+        .map_err(|_| anyhow!("Soloist identity lock failed"))? = Some(owned.device_id()?);
+    let mut runtime = owned;
     let result = transport(&endpoint, &mut runtime, volume, rx, tx, control, started);
-    // Always check owned cleanup, even after a transport failure. An external
-    // endpoint has no Runtime and is never terminated or deactivated here.
-    let cleanup = runtime.as_mut().map_or(Ok(()), |runtime| {
-        runtime
-            .shutdown()
-            .map_err(|_| anyhow!("Soloist owned runtime cleanup failed"))
-    });
+    // Always check owned cleanup, even after a transport failure.
+    let cleanup = runtime
+        .shutdown()
+        .map_err(|_| anyhow!("Soloist owned runtime cleanup failed"));
     if cleanup.is_err() {
         status(tx, "Soloist owned runtime cleanup failed");
     }
@@ -1197,7 +1334,7 @@ fn run(
 
 fn transport(
     endpoint: &str,
-    runtime: &mut Option<soloist_runtime::Runtime>,
+    runtime: &mut soloist_runtime::Runtime,
     volume: u8,
     rx: flume::Receiver<Command>,
     tx: &flume::Sender<EngineEvent>,
@@ -1209,6 +1346,7 @@ fn transport(
         stop_pending,
         phase,
         audio,
+        ..
     } = control;
     let mut session = Session::default();
     let mut intents = Intents::default();
@@ -1216,10 +1354,7 @@ fn transport(
     let mut reconnecting = false;
     let mut initial_volume = Some(volume);
     while !stop.load(Ordering::Acquire) {
-        if runtime
-            .as_mut()
-            .is_some_and(|runtime| !runtime.is_running())
-        {
+        if !runtime.is_running() {
             bail!("Soloist owned runtime exited");
         }
         let connection = Peer::connect(endpoint);
@@ -1233,10 +1368,7 @@ fn transport(
             let connection_result = (|| -> Result<()> {
                 peer.command("get_auth_state")?;
                 while !stop.load(Ordering::Acquire) {
-                    if runtime
-                        .as_mut()
-                        .is_some_and(|runtime| !runtime.is_running())
-                    {
+                    if !runtime.is_running() {
                         runtime_exited = true;
                         bail!("Soloist owned runtime exited");
                     }
@@ -1321,6 +1453,14 @@ fn transport(
                                     peer.command("get_state")?;
                                     peer.send(field_command("get_queue", "limit", 64))?;
                                 }
+                                observe_authentication(
+                                    &value,
+                                    logged_in,
+                                    value["is_active"]
+                                        .as_bool()
+                                        .unwrap_or(session.playback.active),
+                                    tx,
+                                );
                             }
                         } else if authenticated {
                             if value["type"] == "error" {
@@ -1356,6 +1496,13 @@ fn transport(
             if connection_result.is_err() {
                 audio.set_active(false);
                 session.disconnected(tx);
+                emit(
+                    tx,
+                    EngineEvent::Authentication {
+                        logged_in: false,
+                        is_active: false,
+                    },
+                );
             }
         }
         if stop.load(Ordering::Acquire) {
@@ -1687,7 +1834,7 @@ mod tests {
     fn disconnect_cancels_ambiguous_queue_writes_and_deferred_seek_but_not_repeat_preference() {
         let (tx, _rx) = flume::unbounded();
         let mut session = Session {
-            repeat: true,
+            repeat: RepeatMode::All,
             pending: ordered_tracks(vec![B.into()], None, false),
             ..Session::default()
         };
@@ -1697,7 +1844,7 @@ mod tests {
         assert!(session.seek.is_none());
         assert!(session.pending.is_empty());
         assert!(session.sent.is_empty());
-        assert!(session.repeat);
+        assert_eq!(session.repeat, RepeatMode::All);
         assert!(!session.playback.active);
     }
 
@@ -1734,12 +1881,16 @@ mod tests {
         assert!(engine.play_track_at(A.into(), 0).is_err());
     }
 
-    fn test_engine(phase: u8) -> (Engine, flume::Receiver<Command>) {
+    fn test_engine(phase: u8) -> (RuntimePlayer, flume::Receiver<Command>) {
         let (commands, rx) = flume::bounded(MAILBOX_CAPACITY);
-        let engine = Engine {
+        let audio = soloist_runtime::pcm::AudioControl::default();
+        let engine = RuntimePlayer {
             bands: VisBands::shared(),
+            spectrum_enabled: Arc::new(AtomicBool::new(false)),
+            device_id: Arc::new(Mutex::new(None)),
             equalizer: crate::audio::equalizer::shared_equalizer(),
-            audio: soloist_runtime::pcm::AudioControl::default(),
+            playback_gate: PlaybackGate::new(audio.clone()),
+            audio,
             commands,
             stopping: Arc::new(AtomicBool::new(false)),
             stop_pending: Arc::new(AtomicBool::new(false)),
@@ -1747,6 +1898,65 @@ mod tests {
             worker: Mutex::new(None),
         };
         (engine, rx)
+    }
+
+    #[test]
+    fn sdk_playing_requires_verification_without_changing_availability_or_commands() {
+        let (player, commands) = test_engine(READY);
+        let worker_gate = player.playback_gate.clone();
+        let dsp_ready = player.has_local_dsp();
+        assert!(!worker_gate.state.lock().unwrap().verified);
+        assert!(!worker_gate.state.lock().unwrap().applied_active);
+
+        worker_gate.set_active(true);
+        assert!(worker_gate.state.lock().unwrap().audible);
+        assert!(!worker_gate.state.lock().unwrap().applied_active);
+        player.set_verified(true);
+        assert!(worker_gate.state.lock().unwrap().applied_active);
+        player.set_verified(true);
+        assert!(worker_gate.state.lock().unwrap().applied_active);
+        assert_eq!(player.has_local_dsp(), dsp_ready);
+        assert_eq!(player.phase.load(Ordering::Acquire), READY);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn verification_loss_mutes_and_sdk_inactivity_prevents_reactivation() {
+        let (player, commands) = test_engine(READY);
+        let worker_gate = player.playback_gate.clone();
+        worker_gate.set_active(true);
+        player.set_verified(true);
+        assert!(worker_gate.state.lock().unwrap().applied_active);
+
+        player.set_verified(false);
+        assert!(!worker_gate.state.lock().unwrap().applied_active);
+        worker_gate.set_active(true);
+        assert!(!worker_gate.state.lock().unwrap().applied_active);
+        worker_gate.set_active(false);
+        player.set_verified(true);
+        assert!(!worker_gate.state.lock().unwrap().audible);
+        assert!(!worker_gate.state.lock().unwrap().applied_active);
+
+        worker_gate.set_active(true);
+        assert!(worker_gate.state.lock().unwrap().applied_active);
+        worker_gate.set_active(false); // The same invalidation used on disconnect.
+        player.set_verified(true);
+        assert!(!worker_gate.state.lock().unwrap().applied_active);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn shutdown_invalidates_audibility_and_cannot_be_reverified() {
+        let (player, _) = test_engine(READY);
+        player.playback_gate.set_active(true);
+        player.set_verified(true);
+        assert!(player.playback_gate.state.lock().unwrap().applied_active);
+        player.shutdown().unwrap();
+        player.set_verified(true);
+        let state = player.playback_gate.state.lock().unwrap();
+        assert!(!state.verified);
+        assert!(!state.audible);
+        assert!(!state.applied_active);
     }
 
     #[test]
@@ -1953,7 +2163,7 @@ mod tests {
     #[test]
     fn explicit_lists_never_repeat_the_first_sdk_track_as_a_fake_list_repeat() {
         let mut session = Session {
-            repeat: true,
+            repeat: RepeatMode::All,
             ..Session::default()
         };
         assert!(session.context_repeat());
@@ -1967,7 +2177,79 @@ mod tests {
         // Returning to context playback restores the actual user preference.
         session.explicit = false;
         assert!(session.context_repeat());
-        session.repeat = false;
+        session.repeat = RepeatMode::Off;
         assert!(!session.context_repeat());
+    }
+
+    #[test]
+    fn authentication_observations_follow_auth_and_state_but_never_acknowledgements() {
+        let (tx, rx) = flume::unbounded();
+        observe_authentication(
+            &json!({"type":"command_result","logged_in":true,"is_active":true}),
+            true,
+            true,
+            &tx,
+        );
+        assert!(rx.is_empty());
+        for (kind, logged_in, active, expected) in [
+            ("auth_state", false, true, (false, false)),
+            ("auth_state", true, false, (true, false)),
+            ("playback_state", true, true, (true, true)),
+            ("device_changed", true, false, (true, false)),
+        ] {
+            observe_authentication(&json!({"type":kind}), logged_in, active, &tx);
+            assert!(
+                matches!(rx.recv().unwrap(), EngineEvent::Authentication { logged_in, is_active }
+                if (logged_in, is_active) == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_modes_serialize_track_and_context_flags_and_preserve_list_limitations() {
+        for explicit in [false, true] {
+            for (mode, track, context) in [
+                (RepeatMode::Off, false, false),
+                (RepeatMode::One, true, false),
+                (RepeatMode::All, false, !explicit),
+            ] {
+                let session = Session {
+                    repeat: mode,
+                    explicit,
+                    ..Session::default()
+                };
+                assert_eq!(
+                    session.repeat_commands(),
+                    [
+                        json!({"type":"command","command":"set_repeat_track","enabled":track}),
+                        json!({"type":"command","command":"set_repeat_context","enabled":context}),
+                    ]
+                );
+                let (player, commands) = test_engine(READY);
+                player.set_repeat(mode).unwrap();
+                assert!(
+                    matches!(commands.recv().unwrap(), Command::Repeat(received) if received == mode)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_identity_fails_closed_and_spectrum_detachment_clears_telemetry() {
+        let (player, _) = test_engine(READY);
+        assert!(player.device_id().is_err());
+        *player.device_id.lock().unwrap() = Some("validated-sdk-id".into());
+        assert_eq!(player.device_id().unwrap(), "validated-sdk-id");
+        assert!(!player.spectrum_enabled.load(Ordering::Acquire));
+        player.set_spectrum_enabled(true);
+        player.bands.lock().unwrap().values.fill(1.0);
+        player.bands.lock().unwrap().is_active = true;
+        player.set_spectrum_enabled(false);
+        let bands = player.bands.lock().unwrap();
+        assert!(!bands.is_active);
+        assert!(bands.values.iter().all(|value| *value == 0.0));
+        drop(bands);
+        player.shutdown().unwrap();
+        assert!(player.device_id().is_err());
     }
 }

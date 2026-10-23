@@ -6,11 +6,8 @@
 //! it never waits for the UI and allocates nothing while processing samples.
 
 use std::f64::consts::{PI, SQRT_2};
-use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex};
 
-use librespot_playback::audio_backend::{Sink, SinkResult};
-use librespot_playback::convert::Converter;
-use librespot_playback::decoder::AudioPacket;
 use rustfft::num_complex::Complex;
 use serde::{Deserialize, Serialize};
 
@@ -261,54 +258,6 @@ impl FilterBank {
 
     pub(crate) fn reset_states(&mut self) {
         self.states = [[FilterState::default(); NUM_EQ_BANDS]; 2];
-    }
-}
-
-/// A transforming sink: unlike the visualizer tee, this intentionally replaces
-/// sample packets before forwarding them to the next sink.
-pub(crate) struct EqualizerSink {
-    inner: Box<dyn Sink>,
-    control: EqualizerControl,
-    filters: FilterBank,
-}
-
-impl EqualizerSink {
-    pub(crate) fn new(inner: Box<dyn Sink>, control: EqualizerControl) -> Self {
-        let settings = *control.lock().unwrap_or_else(PoisonError::into_inner);
-        Self {
-            inner,
-            control,
-            filters: FilterBank::new(settings),
-        }
-    }
-
-    fn refresh_settings(&mut self) {
-        let settings = match self.control.try_lock() {
-            Ok(settings) => *settings,
-            Err(TryLockError::WouldBlock) => return,
-            Err(TryLockError::Poisoned(error)) => *error.into_inner(),
-        };
-        self.filters.update(settings);
-    }
-}
-
-impl Sink for EqualizerSink {
-    fn start(&mut self) -> SinkResult<()> {
-        self.filters.reset_states();
-        self.inner.start()
-    }
-
-    fn stop(&mut self) -> SinkResult<()> {
-        self.filters.reset_states();
-        self.inner.stop()
-    }
-
-    fn write(&mut self, mut packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
-        self.refresh_settings();
-        if let AudioPacket::Samples(samples) = &mut packet {
-            self.filters.process_interleaved(samples);
-        }
-        self.inner.write(packet, converter)
     }
 }
 

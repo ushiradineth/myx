@@ -111,15 +111,9 @@ pub(crate) fn render_nowplaying_view(
         );
     }
 
-    if app.svc.engine.capabilities().local_dsp {
+    if viz_area.width > 0 && viz_area.height > 0 {
+        out.spectrum = Some(viz_area);
         render_visualizer(f, app, theme, viz_area);
-    } else {
-        f.render_widget(
-            Paragraph::new("Soloist output · EQ / spectrum unavailable")
-                .style(theme.muted())
-                .alignment(Alignment::Center),
-            center_v(viz_area, 1),
-        );
     }
 }
 

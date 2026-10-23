@@ -193,7 +193,6 @@ pub(crate) struct Detail {
 pub(crate) enum Activated {
     None,
     Open(String, String), // drill into a context (uri, name)
-    Radio(String),        // start this song's radio (seed uri)
 }
 
 #[derive(Default, Clone)]
@@ -258,6 +257,7 @@ impl Library {
     /// The fetch gave up (retries exhausted). Mark everything delivered so
     /// empty sections read "(empty)" honestly — the status line carries the
     /// failure message.
+    #[cfg(test)]
     pub(crate) fn mark_all_loaded(&mut self) {
         self.loaded.extend(Section::ALL);
     }

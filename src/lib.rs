@@ -1,9 +1,4 @@
-//! myx — a lean, beautiful terminal Spotify player.
-//!
-//! FE: the design-token system (noodle's visual language) ported to ratatui,
-//! plus album-art-reactive theming with cross-fades.
-//! Backend (`streaming` feature): a lean librespot engine — Connect device + tee'd
-//! FFT visualizer + real track-change events.
+//! Daemon-owned player services and an attachable terminal client.
 
 use std::path::PathBuf;
 
@@ -19,20 +14,18 @@ pub mod reactive;
 pub mod theme;
 pub mod util;
 
-#[cfg(all(feature = "mxc", unix))]
-pub mod mxc;
-
-#[cfg(feature = "streaming")]
 pub mod audio;
-#[cfg(feature = "streaming")]
 pub mod cli;
-#[cfg(feature = "streaming")]
+pub mod client;
 pub mod config;
-#[cfg(feature = "streaming")]
-pub mod engine;
-#[cfg(feature = "streaming")]
+pub mod daemon;
+pub mod domain;
+pub mod ipc;
+pub mod media;
+pub mod player;
+pub mod service;
+pub mod soloist;
 pub mod term;
-#[cfg(feature = "streaming")]
 pub mod webapi;
 
 /// Cross-platform home directory. Uses `HOME` on Unix, `USERPROFILE` on Windows.

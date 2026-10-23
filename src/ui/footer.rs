@@ -35,6 +35,18 @@ pub(crate) fn render_footer(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
             Span::styled("s", Style::default().fg(on(app.transport.shuffle).into())),
             lbl(" shuffle   "),
         ),
+        (
+            false,
+            Span::styled(
+                "R",
+                Style::default().fg(on(app.transport.repeat != RepeatMode::Off).into()),
+            ),
+            lbl(match app.transport.repeat {
+                RepeatMode::Off => " repeat off   ",
+                RepeatMode::One => " repeat one   ",
+                RepeatMode::All => " repeat all   ",
+            }),
+        ),
         (false, key("a"), lbl(" actions   ")),
         (false, key("e"), lbl(" eq   ")),
         (
@@ -44,15 +56,11 @@ pub(crate) fn render_footer(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
         ),
         (false, key("q"), lbl(" quit")),
     ];
-    let mut spans = vec![Span::styled(
-        format!("{}   ", app.svc.engine.name()),
-        theme.muted(),
-    )];
+    let mut spans = Vec::new();
     spans.extend(
         hints
             .into_iter()
             .filter(|(needs_library, ..)| !needs_library || !app.view.zen)
-            .filter(|(_, k, _)| k.content != "e" || app.svc.engine.capabilities().local_dsp)
             .flat_map(|(_, k, label)| [k, label]),
     );
     let line = Line::from(spans);

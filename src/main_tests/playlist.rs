@@ -36,7 +36,7 @@ fn authentication_failure_never_initializes_terminal() {
     let terminal_initialized = std::cell::Cell::new(false);
 
     let result: Result<((), ())> = auth_then_terminal(
-        || anyhow::bail!("cached refresh token was rejected"),
+        || anyhow::bail!("daemon setup requires authorization"),
         || {
             terminal_initialized.set(true);
             Ok(())
@@ -47,43 +47,6 @@ fn authentication_failure_never_initializes_terminal() {
     assert!(!terminal_initialized.get());
 }
 
-// ------------------------------------------------ optional integrations
-
-#[test]
-fn optional_integration_keeps_successful_service() {
-    assert_eq!(
-        optional_integration(true, || Ok::<_, ()>("media")),
-        Some("media")
-    );
-}
-
-#[test]
-fn optional_integration_degrades_on_initialization_failure() {
-    assert_eq!(
-        optional_integration(true, || Err::<(), _>("no session bus")),
-        None
-    );
-}
-
-#[test]
-fn optional_integration_skips_init_when_platform_is_unavailable() {
-    let called = std::cell::Cell::new(false);
-    let service = optional_integration(false, || {
-        called.set(true);
-        Ok::<_, ()>("media")
-    });
-    assert_eq!(service, None);
-    assert!(!called.get());
-}
-
-#[test]
-fn disconnected_media_channel_disables_future_receives() {
-    let mut open = true;
-    let event: Result<(), flume::RecvError> = Err(flume::RecvError::Disconnected);
-    assert_eq!(consume_media_event(event, &mut open), None);
-    assert!(!open);
-}
-
 #[test]
 fn active_scrub_rejects_stale_engine_position() {
     assert!(!should_apply_engine_position(true, Some(42_000)));
@@ -91,30 +54,87 @@ fn active_scrub_rejects_stale_engine_position() {
     assert!(should_apply_engine_position(false, Some(42_000)));
 }
 
-#[test]
-fn startup_restore_requires_the_setting_and_a_saved_track() {
-    let mut saved = SavedState::default();
-    assert!(!should_restore_saved_playback(true, None, &saved));
-
-    saved.last_played = Some(LastPlayed::default());
-    assert!(should_restore_saved_playback(true, None, &saved));
-    assert!(!should_restore_saved_playback(false, None, &saved));
-}
-
-#[test]
-fn explicit_startup_uri_wins_over_the_saved_track() {
-    let saved = SavedState {
-        last_played: Some(LastPlayed::default()),
-        ..SavedState::default()
-    };
-    assert!(!should_restore_saved_playback(
-        true,
-        Some("spotify:album:1"),
-        &saved,
-    ));
-}
-
 // -------------------------------------------------------- context_target
+
+#[test]
+fn attach_uses_daemon_transport_modes_and_preserves_duplicate_queue_entries() {
+    use myx::domain::{QueueEntry, QueueSource};
+    let mut snapshot = Snapshot::starting("test-profile".into(), "test-device".into());
+    snapshot.volume = 0;
+    snapshot.shuffle = true;
+    snapshot.equalizer.gains_db[3] = -4;
+    snapshot.queue.upcoming = vec![
+        QueueEntry {
+            uid: "first".into(),
+            source: QueueSource::Queue,
+            uri: "spotify:track:a".into(),
+            title: Some("A".into()),
+        },
+        QueueEntry {
+            uid: "second".into(),
+            source: QueueSource::Queue,
+            uri: "spotify:track:a".into(),
+            title: Some("A".into()),
+        },
+    ];
+    for repeat in [RepeatMode::Off, RepeatMode::One, RepeatMode::All] {
+        snapshot.repeat = repeat;
+        let transport = Transport::from_snapshot(&snapshot);
+        assert_eq!(
+            transport.volume, 0,
+            "attach must not replace mute with a saved default"
+        );
+        assert!(transport.shuffle);
+        assert_eq!(transport.repeat, repeat);
+        assert_eq!(transport.equalizer, snapshot.equalizer);
+        assert_eq!(transport.queue, ["A", "A"]);
+        assert_eq!(transport.queue_uris, ["spotify:track:a", "spotify:track:a"]);
+    }
+}
+
+#[test]
+fn attach_preserves_observed_playback_states_without_inventing_metadata() {
+    use myx::domain::{ItemKind, PositionAnchor};
+    let mut snapshot = Snapshot::starting("test-profile".into(), "test-device".into());
+    assert!(PlaybackState::from_snapshot(&snapshot, 100).now.is_none());
+    let mut track =
+        myx::domain::TrackMetadata::pending(ItemKind::Episode, "spotify:episode:a".into());
+    track.duration_ms = Some(100_000);
+    snapshot.track = Some(track);
+    for status in [
+        PlaybackStatus::Starting,
+        PlaybackStatus::Playing,
+        PlaybackStatus::Paused,
+        PlaybackStatus::Buffering,
+        PlaybackStatus::Stopped,
+        PlaybackStatus::Disconnected,
+        PlaybackStatus::Error,
+    ] {
+        snapshot.playback = status;
+        snapshot.position = PositionAnchor {
+            position_ms: 10_000,
+            timestamp_ms: 100,
+            speed: if status == PlaybackStatus::Playing {
+                1.0
+            } else {
+                0.0
+            },
+        };
+        let state = PlaybackState::from_snapshot(&snapshot, 1100);
+        let now = state.now.unwrap();
+        assert_eq!(now.uri, "spotify:episode:a");
+        assert!(now.title.is_empty(), "a URI is not a title");
+        assert_eq!(now.is_playing, status == PlaybackStatus::Playing);
+        assert_eq!(
+            now.position_ms,
+            if status == PlaybackStatus::Playing {
+                11_000
+            } else {
+                10_000
+            }
+        );
+    }
+}
 
 #[test]
 fn context_target_accepts_context_rows() {

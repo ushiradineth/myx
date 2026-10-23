@@ -1,27 +1,50 @@
-//! Side-effect-free player argument parsing. `parse_from` takes full argv,
-//! including the executable name. Environment overrides belong to the caller.
+//! Side-effect-free full-argv parsing. Environment and filesystem access belong
+//! to the caller, including selection of the configuration before its first use.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{bail, ensure, Result};
 
-use crate::config::BackendKind;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Tui,
+    Daemon(DaemonCommand),
+    Service(ServiceCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonCommand {
+    Run,
+    Start,
+    Stop,
+    Restart,
+    Status,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceCommand {
+    Install,
+    Uninstall,
+    Status,
+}
 
 #[derive(Debug, Default)]
 pub struct Cli {
-    pub backend: Option<BackendKind>,
+    pub mode: Mode,
     pub uri: Option<String>,
     pub headless: bool,
     pub duration: Option<Duration>,
-    pub no_web_api: bool,
     pub non_interactive: bool,
     pub volume: Option<u8>,
     pub help: bool,
+    pub version: bool,
+    pub config: Option<PathBuf>,
+    pub json: bool,
 }
 
 impl Cli {
-    /// Parse full argv, with no network, environment, filesystem or TTY access.
-    /// Headless playback requires an explicit bounded duration.
+    /// Parse full argv without environment, filesystem, network or TTY access.
     pub fn parse_from<I, S>(args: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -31,6 +54,8 @@ impl Cli {
         let _program = args.next();
         let mut cli = Self::default();
         let mut positional_only = false;
+        let mut command_group = None;
+        let mut command_seen = false;
         while let Some(arg) = args.next() {
             let arg = arg.as_ref();
             if !positional_only && arg == "--" {
@@ -40,9 +65,12 @@ impl Cli {
             if !positional_only && arg.starts_with('-') {
                 let (flag, inline) = arg
                     .split_once('=')
-                    .map_or((arg, None), |(k, v)| (k, Some(v)));
+                    .map_or((arg, None), |(key, value)| (key, Some(value)));
                 match flag {
-                    "--backend" | "--api" | "--duration" | "--volume" => {
+                    "--backend" | "--api" | "--no-web-api" | "--theme" => {
+                        bail!("removed mode or option; use --help for supported commands")
+                    }
+                    "--duration" | "--volume" | "--config" => {
                         let next;
                         let value = match inline {
                             Some(value) => value,
@@ -58,10 +86,6 @@ impl Cli {
                             "option requires a value"
                         );
                         match flag {
-                            "--backend" | "--api" => {
-                                ensure!(cli.backend.is_none(), "backend specified more than once");
-                                cli.backend = Some(value.parse()?);
-                            }
                             "--duration" => {
                                 ensure!(
                                     cli.duration.is_none(),
@@ -83,31 +107,79 @@ impl Cli {
                                     "volume must be an integer from 0 to 100",
                                 )? as u8);
                             }
-                            _ => unreachable!(),
+                            _ => {
+                                ensure!(cli.config.is_none(), "config specified more than once");
+                                cli.config = Some(PathBuf::from(value));
+                            }
                         }
                     }
-                    "--headless" | "--no-web-api" | "--non-interactive" | "--help" | "-h" => {
+                    "--headless" | "--non-interactive" | "--json" | "--help" | "-h"
+                    | "--version" | "-V" => {
                         ensure!(inline.is_none(), "flag does not accept a value");
                         match flag {
                             "--headless" => cli.headless = true,
-                            "--no-web-api" => cli.no_web_api = true,
                             "--non-interactive" => cli.non_interactive = true,
+                            "--json" => cli.json = true,
+                            "--version" | "-V" => cli.version = true,
                             _ => cli.help = true,
                         }
                     }
                     _ => bail!("unknown option; use --help for usage"),
                 }
+            } else if !positional_only && arg == "theme" {
+                bail!("removed mode or option; use --help for supported commands");
+            } else if command_group.is_some() && !command_seen {
+                cli.mode = match (command_group, arg) {
+                    (Some("daemon"), "run") => Mode::Daemon(DaemonCommand::Run),
+                    (Some("daemon"), "start") => Mode::Daemon(DaemonCommand::Start),
+                    (Some("daemon"), "stop") => Mode::Daemon(DaemonCommand::Stop),
+                    (Some("daemon"), "restart") => Mode::Daemon(DaemonCommand::Restart),
+                    (Some("daemon"), "status") => Mode::Daemon(DaemonCommand::Status),
+                    (Some("service"), "install") => Mode::Service(ServiceCommand::Install),
+                    (Some("service"), "uninstall") => Mode::Service(ServiceCommand::Uninstall),
+                    (Some("service"), "status") => Mode::Service(ServiceCommand::Status),
+                    _ => bail!("unknown management command; use --help for usage"),
+                };
+                command_seen = true;
+            } else if !positional_only && matches!(arg, "daemon" | "service") {
+                ensure!(
+                    command_group.is_none() && cli.uri.is_none(),
+                    "unexpected command"
+                );
+                command_group = Some(if arg == "daemon" { "daemon" } else { "service" });
             } else {
+                ensure!(
+                    command_group.is_none(),
+                    "management commands do not accept a URI"
+                );
                 ensure!(cli.uri.is_none(), "only one Spotify URI may be supplied");
                 cli.uri = Some(normalize_uri(arg)?);
             }
         }
         ensure!(
+            command_group.is_none() || command_seen || cli.help || cli.version,
+            "management command required; use --help for usage"
+        );
+        if command_group.is_some() {
+            ensure!(
+                !cli.headless && cli.duration.is_none() && cli.volume.is_none(),
+                "playback options cannot be used with management commands"
+            );
+        }
+        ensure!(
+            !cli.json
+                || matches!(
+                    cli.mode,
+                    Mode::Daemon(DaemonCommand::Status) | Mode::Service(ServiceCommand::Status)
+                ),
+            "--json requires a status command"
+        );
+        ensure!(
             cli.headless || cli.duration.is_none(),
             "--duration requires --headless"
         );
         ensure!(
-            !cli.headless || cli.duration.is_some() || cli.help,
+            !cli.headless || cli.duration.is_some() || cli.help || cli.version,
             "--headless requires --duration (1 to 86400 seconds)"
         );
         Ok(cli)
@@ -124,7 +196,7 @@ fn bounded_number(value: &str, min: u64, max: u64, error: &'static str) -> Resul
     Ok(number)
 }
 
-fn normalize_uri(value: &str) -> Result<String> {
+pub fn normalize_uri(value: &str) -> Result<String> {
     let invalid = || {
         anyhow::anyhow!("expected a Spotify track, album, playlist, artist or episode URI or HTTPS share URL with a 22-character ID")
     };
@@ -165,78 +237,129 @@ mod tests {
     const ID: &str = "0123456789abcdefghijkl";
 
     #[test]
-    fn defaults_and_full_headless_options() {
+    fn defaults_and_bounded_playback_options() {
         let cli = Cli::parse_from(["myx"]).unwrap();
-        assert!(cli.backend.is_none() && cli.uri.is_none() && cli.duration.is_none());
-        assert!(!cli.headless && !cli.no_web_api && !cli.non_interactive && !cli.help);
-        assert!(cli.volume.is_none());
-        let cli = Cli::parse_from([
-            "myx",
-            "--api",
-            "soloist",
-            "--headless",
-            "--duration=86400",
-            "--no-web-api",
-            "--non-interactive",
-            "--volume",
-            "0",
-        ])
-        .unwrap();
-        assert_eq!(cli.backend, Some(BackendKind::Soloist));
-        assert_eq!(cli.duration, Some(Duration::from_secs(86400)));
-        assert!(cli.headless && cli.no_web_api && cli.non_interactive);
-        assert_eq!(cli.volume, Some(0));
-        assert_eq!(
-            Cli::parse_from(["myx", "--backend=normal", "--volume=100"])
-                .unwrap()
-                .backend,
-            Some(BackendKind::Normal)
-        );
+        assert_eq!(cli.mode, Mode::Tui);
+        assert!(cli.uri.is_none() && cli.duration.is_none() && cli.config.is_none());
+        assert!(!cli.help && !cli.version && !cli.json && !cli.headless);
+        for (seconds, volume) in [("1", "0"), ("86400", "100")] {
+            let cli = Cli::parse_from([
+                "myx",
+                "--headless",
+                "--duration",
+                seconds,
+                "--volume",
+                volume,
+                "--non-interactive",
+                "--config=/private/myx.toml",
+            ])
+            .unwrap();
+            assert_eq!(cli.duration.unwrap().as_secs().to_string(), seconds);
+            assert_eq!(cli.volume.unwrap().to_string(), volume);
+            assert!(cli.non_interactive);
+            assert_eq!(cli.config, Some(PathBuf::from("/private/myx.toml")));
+        }
         assert!(Cli::parse_from(["myx", "-h"]).unwrap().help);
         assert!(Cli::parse_from(["myx", "--help"]).unwrap().help);
-        assert_eq!(
-            Cli::parse_from(["myx", "--duration", "1", "--headless"])
-                .unwrap()
-                .duration,
-            Some(Duration::from_secs(1))
-        );
+        assert!(Cli::parse_from(["myx", "-V"]).unwrap().version);
+        assert!(Cli::parse_from(["myx", "--version"]).unwrap().version);
     }
 
     #[test]
-    fn invalid_options_and_unsafe_automation_are_rejected_without_echoing_input() {
+    fn management_commands_and_global_flags() {
+        for (group, command, expected) in [
+            ("daemon", "run", Mode::Daemon(DaemonCommand::Run)),
+            ("daemon", "start", Mode::Daemon(DaemonCommand::Start)),
+            ("daemon", "stop", Mode::Daemon(DaemonCommand::Stop)),
+            ("daemon", "restart", Mode::Daemon(DaemonCommand::Restart)),
+            ("daemon", "status", Mode::Daemon(DaemonCommand::Status)),
+            ("service", "install", Mode::Service(ServiceCommand::Install)),
+            (
+                "service",
+                "uninstall",
+                Mode::Service(ServiceCommand::Uninstall),
+            ),
+            ("service", "status", Mode::Service(ServiceCommand::Status)),
+        ] {
+            let cli = Cli::parse_from([
+                "myx",
+                "--config",
+                "/private/test.toml",
+                group,
+                "--non-interactive",
+                command,
+            ])
+            .unwrap();
+            assert_eq!(cli.mode, expected);
+            assert!(cli.non_interactive);
+            if command == "status" {
+                assert!(
+                    Cli::parse_from(["myx", group, command, "--json"])
+                        .unwrap()
+                        .json
+                );
+            }
+        }
+        assert!(Cli::parse_from(["myx", "daemon", "--help"]).unwrap().help);
+        assert!(Cli::parse_from(["myx", "service", "--help"]).unwrap().help);
+    }
+
+    #[test]
+    fn removed_and_invalid_inputs_never_echo_supplied_secrets() {
         for args in [
-            vec!["--backend", "secret-value"],
-            vec!["--backend"],
-            vec!["--backend", "normal", "--api", "soloist"],
+            vec!["--backend=PRIVATE-SENTINEL"],
+            vec!["--api", "PRIVATE-SENTINEL"],
+            vec!["--no-web-api"],
+            vec!["theme", "PRIVATE-SENTINEL"],
+            vec!["--theme=PRIVATE-SENTINEL"],
             vec!["--headless"],
             vec!["--duration", "1"],
             vec!["--headless", "--duration", "0"],
             vec!["--headless", "--duration", "86401"],
-            vec!["--headless", "--duration", "1.5"],
             vec!["--headless", "--duration", "18446744073709551616"],
             vec!["--volume", "101"],
             vec!["--volume", "-1"],
             vec!["--volume", "+1"],
-            vec!["--volume", "secret-value"],
-            vec!["--headless=secret-value"],
-            vec!["--secret-value"],
-            vec!["secret-value"],
+            vec!["--volume=PRIVATE-SENTINEL"],
+            vec!["--help=PRIVATE-SENTINEL"],
+            vec!["--PRIVATE-SENTINEL"],
+            vec!["PRIVATE-SENTINEL"],
+            vec!["daemon"],
+            vec!["service"],
+            vec!["daemon", "PRIVATE-SENTINEL"],
+            vec!["service", "run"],
+            vec!["daemon", "status", "--volume=1"],
+            vec!["--json"],
+            vec!["daemon", "start", "--json"],
+            vec!["--config"],
+            vec!["--config="],
+            vec!["--config=a", "--config=b"],
+            vec!["--volume=1", "--volume=2"],
+            vec!["--headless", "--duration=1", "--duration=2"],
         ] {
             let error = Cli::parse_from(std::iter::once("myx").chain(args))
                 .unwrap_err()
                 .to_string();
-            assert!(!error.contains("secret-value"));
+            assert!(!error.contains("PRIVATE-SENTINEL"));
+        }
+        for option in ["--backend", "--api", "--no-web-api", "theme"] {
+            assert!(Cli::parse_from(["myx", option])
+                .unwrap_err()
+                .to_string()
+                .contains("removed"));
         }
     }
 
     #[test]
-    fn canonical_uris_and_share_urls_normalize_without_network_access() {
+    fn canonical_uris_and_share_urls_remain_supported() {
         for kind in ["track", "album", "playlist", "artist", "episode"] {
             let canonical = format!("spotify:{kind}:{ID}");
             for input in [
                 canonical.clone(),
-                format!("https://open.spotify.com/{kind}/{ID}?si=secret-value"),
-                format!("https://open.spotify.com/intl-en/{kind}/{ID}?si=secret-value#fragment"),
+                format!("https://open.spotify.com/{kind}/{ID}?si=PRIVATE-SENTINEL"),
+                format!(
+                    "https://open.spotify.com/intl-en/{kind}/{ID}?si=PRIVATE-SENTINEL#fragment"
+                ),
             ] {
                 assert_eq!(
                     Cli::parse_from(["myx", &input]).unwrap().uri.as_deref(),
@@ -246,17 +369,17 @@ mod tests {
         }
         for input in [
             format!("spotify:show:{ID}"),
-            format!("spotify:track:{ID}?si=secret-value"),
+            format!("spotify:track:{ID}?si=PRIVATE-SENTINEL"),
             format!("http://open.spotify.com/track/{ID}"),
             format!("https://open.spotify.com.evil/track/{ID}"),
             format!("https://open.spotify.com/track/{ID}/extra"),
             "spotify:track:short".into(),
-            format!("spotify:track:{}!", &ID[..21]),
         ] {
             assert!(Cli::parse_from(["myx", &input]).is_err());
         }
         let uri = format!("spotify:track:{ID}");
         assert!(Cli::parse_from(["myx", &uri, &uri]).is_err());
+        assert!(Cli::parse_from(["myx", "daemon", "run", &uri]).is_err());
         assert_eq!(
             Cli::parse_from(["myx", "--", &uri]).unwrap().uri.as_deref(),
             Some(uri.as_str())

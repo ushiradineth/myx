@@ -213,6 +213,8 @@ fn pairing_port(line: &[u8]) -> Option<u16> {
     number.parse::<u16>().ok().filter(|&value| value != 0)
 }
 
+/// Return only the public deviceID from getInfo after verifying the listener
+/// belongs to the owned SDK. The response and pairing key remain private.
 pub fn pairing_identity(
     pid: u32,
     port: u16,
@@ -361,6 +363,8 @@ mod tests {
             ("publicKey", json!("")),
             ("deviceID", json!("bad.name")),
             ("deviceID", json!("设备")),
+            ("deviceID", json!("")),
+            ("deviceID", Value::Null),
         ] {
             let old = info[field].clone();
             info[field] = wrong;

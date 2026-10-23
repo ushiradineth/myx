@@ -12,23 +12,18 @@ pub(crate) fn handle_engine_event(
         liblog(format!("engine: {ev:?}"));
     }
     match ev {
+        EngineEvent::ReadModel(snapshot) => {
+            app.transport = Transport::from_snapshot(&snapshot);
+            app.playback
+                .apply_snapshot(&snapshot, myx::domain::playback::now_ms());
+            if let Some(message) = snapshot.message {
+                app.status = message;
+            }
+        }
         EngineEvent::TrackChanged { uri } => {
             app.status = "loading track…".to_string();
-            if app.svc.engine.is_soloist() {
-                // SDK metadata arrives separately; no Web API credentials are needed.
-                app.session.pending_meta = Some(uri);
-                return;
-            }
-            if let Some(track_id) = track_id_from_uri(&uri) {
-                // Record what we're waiting for so an earlier track's reply,
-                // landing late, is discarded instead of overwriting this one.
-                app.session.pending_meta = Some(format!("spotify:track:{track_id}"));
-                let webapi = app.svc.webapi.clone();
-                let tx = meta_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = tx.send(fetch_track_meta(&webapi, &track_id));
-                });
-            }
+            // The daemon resolves metadata. Keep the stale-artwork guard local.
+            app.session.pending_meta = Some(uri);
         }
         EngineEvent::Metadata(meta) => {
             if !meta_is_current(app.session.pending_meta.as_deref(), &meta.uri) {
@@ -73,93 +68,47 @@ pub(crate) fn handle_engine_event(
         }
         EngineEvent::BackendStatus { message } => app.status = message,
         EngineEvent::Playing { position_ms, .. } => {
-            if !app.transport.playback_started {
-                app.transport.playback_started = true;
-                // Reapply persisted modes + volume to the freshly-started playback.
-                let _ = app.svc.engine.shuffle(app.transport.shuffle);
-                let _ = app.svc.engine.repeat(app.transport.repeat);
-                let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
-            }
+            app.transport.playback_started = true;
             if let Some(n) = app.playback.now.as_mut() {
                 n.is_playing = true;
             }
             app.playback.set_local_position(position_ms, true);
-            if let Some(controls) = app.media_controls.as_mut() {
-                let _ = controls.set_playback(MediaPlayback::Playing {
-                    progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                });
-            }
         }
         EngineEvent::Paused { position_ms, .. } => {
             if let Some(n) = app.playback.now.as_mut() {
                 n.is_playing = false;
             }
             app.playback.set_local_position(position_ms, true);
-            if let Some(controls) = app.media_controls.as_mut() {
-                let _ = controls.set_playback(MediaPlayback::Paused {
-                    progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                });
-            }
         }
         EngineEvent::Stopped => {
-            if app.svc.engine.is_soloist() {
-                // Discard cover work still in flight for the stopped track.
-                app.session.pending_meta = Some(String::new());
-            }
+            // Discard cover work still in flight for the stopped track.
+            app.session.pending_meta = Some(String::new());
             app.playback.now = None;
             app.transport.playback_started = false;
-            // librespot cleared its context too, so only a fresh load can
-            // resume from here — not a bare `play`.
-
-            if let Some(controls) = app.media_controls.as_mut() {
-                let _ = controls.set_playback(MediaPlayback::Stopped);
-            }
         }
         EngineEvent::PositionCorrection { position_ms, .. } => {
             app.playback.set_local_position(position_ms, true);
-            if let (Some(n), Some(controls)) =
-                (app.playback.now.as_ref(), app.media_controls.as_mut())
-            {
-                let playback = if n.is_playing {
-                    MediaPlayback::Playing {
-                        progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                    }
-                } else {
-                    MediaPlayback::Paused {
-                        progress: Some(MediaPosition(Duration::from_millis(position_ms as u64))),
-                    }
-                };
-                let _ = controls.set_playback(playback);
-            }
         }
         EngineEvent::Reconnecting => {
-            // The old player is gone with the old connection, so the audio has
-            // already stopped. Stop the progress bar with it instead of letting
-            // it run on to the end of a track nobody is hearing.
-            if app.playback.freeze() {
-                app.transport.resume_after_reconnect = true;
-            }
+            app.playback.freeze();
             app.status = "connection dropped — reconnecting…".to_string();
         }
         EngineEvent::Reconnected => {
-            // The replacement device has nothing loaded: `toggle`/`next` on it
-            // are no-ops, so play must go back through the resume path. When
-            // audio was playing, the main loop resumes it right away.
-            let had_playback = std::mem::take(&mut app.transport.playback_started);
-            if let Some(controls) = app.media_controls.as_mut() {
-                let _ = controls.set_playback(MediaPlayback::Paused {
-                    progress: Some(MediaPosition(Duration::from_millis(
-                        app.playback.position_ms() as u64,
-                    ))),
-                });
+            app.status = "reconnected".to_string();
+        }
+        EngineEvent::Authentication {
+            logged_in,
+            is_active,
+        } => {
+            if !logged_in || !is_active {
+                app.playback.freeze();
+                app.status = if logged_in {
+                    "playback is not locally active"
+                } else {
+                    "daemon authorization required"
+                }
+                .into();
             }
-            app.status = if app.transport.resume_after_reconnect {
-                "reconnected — resuming…".to_string()
-            } else if had_playback {
-                "reconnected — press play to resume".to_string()
-            } else {
-                "reconnected".to_string()
-            };
         }
         EngineEvent::EndOfTrack { .. } => {}
     }
@@ -219,6 +168,10 @@ pub(crate) fn apply_meta(
         return;
     }
 
+    if meta.image.image.is_none() && meta.image.url.is_some() {
+        liblog("cover: no decoded artwork for current track");
+    }
+
     let cover = meta
         .image
         .image
@@ -276,80 +229,14 @@ pub(crate) fn apply_meta(
 
     if let Some(theme) = meta.theme {
         app.theme.start_fade(theme);
-        // Same instant, same palette: whatever the UI is fading towards is
-        // exactly what subscribers are told to fade towards.
-        #[cfg(all(feature = "mxc", unix))]
-        publish_theme(app, &theme);
     }
-
-    if let Some(controls) = app.media_controls.as_mut() {
-        let _ = controls.set_metadata(MediaMetadata {
-            title: app.playback.now.as_ref().map(|n| n.title.as_str()),
-            artist: app.playback.now.as_ref().map(|n| n.artist.as_str()),
-            album: app.playback.now.as_ref().map(|n| n.album.as_str()),
-            cover_url: meta.image.url.as_deref(),
-            duration: app
-                .playback
-                .now
-                .as_ref()
-                .map(|n| Duration::from_millis(n.duration_ms as u64)),
-        });
-    }
-}
-
-/// Broadcast the new palette over MXC, if a publisher is running.
-///
-/// Called from the one place a track's palette is adopted, so the `Origin` can
-/// carry the metadata that produced it — that provenance is what lets a
-/// subscriber show "now playing" text or ignore everything that is not album
-/// art. The fields are read back out of `app.playback.now`, which was assigned
-/// from this very `TrackMeta` a few lines above (the `meta` fields themselves
-/// have been moved into it by then); `apply_meta` has already returned early
-/// for a stale reply, so this is always the current track.
-///
-/// Empty strings are omitted rather than sent as `Some("")`: the wire contract
-/// says an absent field is unknown, and `""` would force every consumer to
-/// re-check what the publisher already knows.
-///
-/// `fade_ms` is [`FADE_MS`] itself — the same constant `start_fade` uses — so
-/// a consumer's cross-fade cannot drift out of sync with Myx's own.
-#[cfg(all(feature = "mxc", unix))]
-fn publish_theme(app: &App, theme: &Theme) {
-    use myx::mxc::{Origin, OriginKind};
-
-    let Some(publisher) = app.mxc.as_ref() else {
-        return;
-    };
-    let now = app.playback.now.as_ref();
-    let field = |get: fn(&NowPlaying) -> &str| {
-        now.map(get)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    };
-
-    let track = field(|n| n.title.as_str());
-    publisher.publish(
-        Origin {
-            kind: OriginKind::AlbumArt,
-            // The title is the human-facing label; a track with no title (a
-            // local file, a podcast segment) still has a palette worth naming.
-            name: track.clone().unwrap_or_else(|| "album".to_string()),
-            track,
-            artist: field(|n| n.artist.as_str()),
-            album: field(|n| n.album.as_str()),
-            track_id: field(|n| n.uri.as_str()),
-        },
-        theme,
-        u32::try_from(FADE_MS).unwrap_or(u32::MAX),
-    );
 }
 
 /// Does this row carry a playable context URI, and under what name?
 ///
 /// Context rows (playlist / album / artist) and the synthesized "▶︎ Play X"
 /// rows both do; headers and tracks do not. Kept pure and free-standing so it
-/// is unit-testable — `App` owns a librespot `Spirc` and cannot be built in a
-/// test. `enter_label` shares this predicate so Enter opens exactly the rows
+/// is unit-testable without a daemon connection. `enter_label` shares this predicate so Enter opens exactly the rows
 /// `P` plays.
 pub(crate) fn context_target(item: &LibItem) -> Option<(String, String)> {
     (!item.is_header() && !item.is_track()).then(|| (item.uri.clone(), item.name.clone()))

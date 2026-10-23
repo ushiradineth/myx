@@ -96,6 +96,19 @@ impl Runtime {
         self.endpoint.clone()
     }
 
+    /// Public deviceID validated at the owned SDK's pairing endpoint and used
+    /// for discovery registration. No pairing/key/account payload is exposed.
+    pub fn device_id(&self) -> Result<String> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.managed.device_id().map(str::to_owned)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            anyhow::bail!("owned SDK device identity is unavailable on this platform")
+        }
+    }
+
     pub fn is_running(&mut self) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {

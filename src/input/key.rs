@@ -76,14 +76,7 @@ pub(crate) fn handle_key(
 
     match code {
         KeyCode::Char('e') => {
-            if app.svc.engine.capabilities().local_dsp {
-                app.view.equalizer = Some(EqualizerOverlay::default());
-            } else {
-                app.status = format!(
-                    "{} does not support local PCM EQ/FFT",
-                    app.svc.engine.name()
-                );
-            }
+            app.view.equalizer = Some(EqualizerOverlay::default());
         }
         KeyCode::Char('/') => {
             app.search.input_mode = true;
@@ -100,19 +93,8 @@ pub(crate) fn handle_key(
             // Nothing to back out of — Esc no longer quits (use q or Ctrl-C twice).
         }
         KeyCode::Char(' ') | KeyCode::Char('p') | KeyCode::Media(MediaKeyCode::PlayPause) => {
-            if app.transport.playback_started {
-                let _ = app.svc.engine.toggle();
-            } else {
-                if matches!(app.transport.source, PlaySource::Radio(_))
-                    && !app.svc.engine.capabilities().radio
-                {
-                    app.status =
-                        format!("{} does not support Mercury radio", app.svc.engine.name());
-                    return false;
-                }
-                // Resume the persisted source (context/radio/liked).
-                resume_source(app, &chans.radio);
-                app.transport.playback_started = true;
+            if let Err(error) = app.svc.engine.toggle() {
+                app.status = format!("playback control failed: {error}");
             }
         }
         KeyCode::Media(MediaKeyCode::Stop) => {
@@ -141,22 +123,23 @@ pub(crate) fn handle_key(
         // the actions menu.
         KeyCode::Char('P') => play_selected_context(app, false),
         KeyCode::Char('S') => {
-            // Flip the global toggle too, or the footer would show shuffle off
-            // while playback is shuffled, and `resume_source` would later
-            // replay this context unshuffled.
+            // Keep the visible toggle consistent with this explicit request.
             app.transport.shuffle = true;
             let _ = app.svc.engine.shuffle(true);
             play_selected_context(app, true);
         }
         KeyCode::Char('R') => {
-            app.transport.repeat = !app.transport.repeat;
-            let _ = app.svc.engine.repeat(app.transport.repeat);
+            app.transport.repeat = match app.transport.repeat {
+                RepeatMode::Off => RepeatMode::All,
+                RepeatMode::All => RepeatMode::One,
+                RepeatMode::One => RepeatMode::Off,
+            };
+            let _ = app.svc.engine.set_repeat(app.transport.repeat);
         }
         KeyCode::Char('r') => {
             if !app.svc.webapi.lock().is_ok_and(|api| api.is_available()) {
                 app.status =
-                    "Web API browsing is not configured; Soloist playback is still available"
-                        .into();
+                    "daemon catalog unavailable; check daemon status and authorization".into();
                 return false;
             }
             app.status = "loading library…".to_string();
@@ -241,60 +224,20 @@ pub(crate) fn handle_key(
         KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
         // Needs a terminal that reports modified Enter (kitty, WezTerm, foot).
         KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => play_selected_context(app, false),
-        KeyCode::Enter => {
-            // activate() records the radio source, so reject before mutating it.
-            if app.search.searching
-                && app
-                    .cur_items()
-                    .get(app.browse.selected)
-                    .is_some_and(|item| item.is_track())
-                && !app.svc.engine.capabilities().radio
-            {
-                app.status = format!("{} does not support Mercury radio", app.svc.engine.name());
-                return false;
+        KeyCode::Enter => match app.activate() {
+            Activated::Open(uri, name) => {
+                spawn_detail_fetch(app.svc.webapi.clone(), uri, name, chans.detail.clone());
             }
-            match app.activate() {
-                Activated::Open(uri, name) => {
-                    spawn_detail_fetch(app.svc.webapi.clone(), uri, name, chans.detail.clone());
-                }
-                Activated::Radio(uri) => {
-                    if !app.svc.engine.capabilities().radio {
-                        app.status =
-                            format!("{} does not support Mercury radio", app.svc.engine.name());
-                        return false;
-                    }
-                    app.status = "starting radio…".to_string();
-                    let tracks = app.svc.engine.radio_tracks(uri);
-                    let tx = chans.radio.clone();
-                    tokio::spawn(async move {
-                        let res = match tokio::time::timeout(Duration::from_secs(12), tracks).await
-                        {
-                            Ok(r) => r.map_err(|e| e.to_string()),
-                            Err(_) => {
-                                Err("timed out (mercury radio endpoint unresponsive)".to_string())
-                            }
-                        };
-                        let _ = tx.send(res.map(|uris| Radio {
-                            uris,
-                            start_position_ms: 0,
-                        }));
-                    });
-                }
-                Activated::None => {}
-            }
-        }
+            Activated::None => {}
+        },
         _ => {}
     }
     false
 }
 
-fn request_visible_queue(app: &mut App, chans: &UiChannels) {
-    if app.svc.engine.is_soloist() {
-        if let Err(e) = app.svc.engine.request_queue() {
-            app.status = format!("queue refresh failed: {e}");
-        }
-    } else {
-        spawn_queue_fetch(app.svc.webapi.clone(), chans.queue.clone());
+fn request_visible_queue(app: &mut App, _chans: &UiChannels) {
+    if let Err(e) = app.svc.engine.request_queue() {
+        app.status = format!("queue refresh failed: {e}");
     }
 }
 

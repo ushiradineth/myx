@@ -45,6 +45,8 @@ pub(crate) struct FrameOut {
     /// Album-art footprint in the current frame. Used to restore pixels that
     /// an overlay covered without forcing a blank intermediate frame.
     pub(crate) art: Option<Rect>,
+    /// Actual spectrum footprint from the last frame, for demand subscription.
+    pub(crate) spectrum: Option<Rect>,
     /// Library viewport start row. Unlike `hits`, this is read-modify-write:
     /// the renderer feeds the previous frame's value into `scroll_offset` and
     /// stores the result back, which is what makes scrolling sticky. Owned by
@@ -87,7 +89,7 @@ pub(crate) const ANIM_FRAME: Duration = Duration::from_millis(33);
 /// Redraw rate when nothing changed — enough to keep the clock and progress bar
 /// honest without repainting an identical frame 60 times a second.
 pub(crate) const IDLE_REDRAW: Duration = Duration::from_millis(500);
-/// How often the live queue is re-fetched and the session persisted.
+/// How often the viewer requests a live queue refresh.
 pub(crate) const SYNC_EVERY: Duration = Duration::from_secs(24);
 
 /// Whether this frame is worth drawing.

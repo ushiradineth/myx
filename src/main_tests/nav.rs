@@ -139,22 +139,6 @@ fn the_loading_screen_is_centred_on_both_axes() {
     );
 }
 
-// ------------------------------------------------------------ retry_delay
-
-#[test]
-fn short_backoffs_are_waited_out_long_ones_are_not() {
-    assert!(retry_delay(Some(1)).is_some());
-    assert!(retry_delay(Some(5)).is_some());
-    assert!(
-        retry_delay(None).is_some(),
-        "no header means a token bounce"
-    );
-    // Spotify answers with hours once a development-mode quota is spent;
-    // sleeping on that froze a drill-in for minutes and failed anyway.
-    assert!(retry_delay(Some(60)).is_none());
-    assert!(retry_delay(Some(76_854)).is_none());
-}
-
 // ---------------------------------------------------------- scrub_target
 
 #[test]

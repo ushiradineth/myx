@@ -26,6 +26,7 @@ use crate::*;
 
 pub(crate) fn render(f: &mut Frame, app: &App, out: &mut FrameOut, repaint: ArtRepaint) {
     out.art = None;
+    out.spectrum = None;
     let theme = app.theme.displayed;
     let area = f.area();
     f.render_widget(Block::default().style(theme.base()), area);

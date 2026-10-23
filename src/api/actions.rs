@@ -17,7 +17,7 @@ pub(crate) fn spawn_action_menu(
         if !webapi.lock().map(|w| w.is_available()).unwrap_or(false) {
             return;
         }
-        if let Some(token) = token_of(&webapi) {
+        if let Some(token) = connection_of(&webapi) {
             let _ = tx.send(build_action_menu(Some(&token), &item));
         }
     });
@@ -25,13 +25,13 @@ pub(crate) fn spawn_action_menu(
 
 /// Build the context menu for `item`, checking saved/following state and
 /// resolving related artist/album links up front.
-pub(crate) fn build_action_menu(token: Option<&str>, item: &LibItem) -> ActionMenu {
+pub(crate) fn build_action_menu(token: Option<&Connection>, item: &LibItem) -> ActionMenu {
     let mut parts = item.uri.split(':');
     parts.next();
     let kind = parts.next().unwrap_or("");
     let id = parts.next().unwrap_or("").to_string();
     let uri = item.uri.clone();
-    // Only build the blocking client for the enriched (Some token) path; the
+    // Only build the blocking client for the enriched connection path; the
     // instant (None) path runs on the async loop where dropping reqwest's inner
     // runtime would panic.
     let client = token.map(|_| http_client());
@@ -215,25 +215,23 @@ pub(crate) fn build_action_menu(token: Option<&str>, item: &LibItem) -> ActionMe
 }
 
 pub(crate) fn spawn_action(
-    engine: &Engine,
+    engine: &Player,
     webapi: Arc<Mutex<WebApi>>,
     kind: ActionKind,
     tx: flume::Sender<String>,
 ) {
-    if engine.is_soloist() {
-        if let ActionKind::Queue { uri } = kind {
-            // The Web API player endpoint targets the account's active device,
-            // which may not be this SDK player. Always use its own queue.
-            let msg = match engine.add_to_queue(uri) {
-                Ok(()) => match engine.request_queue() {
-                    Ok(()) => "added to queue".to_string(),
-                    Err(e) => format!("added to queue; refresh failed: {e}"),
-                },
-                Err(e) => format!("queue failed: {e}"),
-            };
-            let _ = tx.send(msg);
-            return;
-        }
+    if let ActionKind::Queue { uri } = kind {
+        // Queue intent goes to the daemon's controller, not an account-global
+        // player endpoint selected by a client.
+        let msg = match engine.add_to_queue(uri) {
+            Ok(()) => match engine.request_queue() {
+                Ok(()) => "added to queue".to_string(),
+                Err(e) => format!("added to queue; refresh failed: {e}"),
+            },
+            Err(e) => format!("queue failed: {e}"),
+        };
+        let _ = tx.send(msg);
+        return;
     }
     tokio::task::spawn_blocking(move || {
         if !webapi.lock().map(|w| w.is_available()).unwrap_or(false) {
@@ -243,7 +241,7 @@ pub(crate) fn spawn_action(
             );
             return;
         }
-        let msg = match token_of(&webapi) {
+        let msg = match connection_of(&webapi) {
             Some(t) => run_action(&t, kind),
             None => "not authorized".to_string(),
         };
@@ -251,7 +249,7 @@ pub(crate) fn spawn_action(
     });
 }
 
-pub(crate) fn run_action(token: &str, kind: ActionKind) -> String {
+pub(crate) fn run_action(token: &Connection, kind: ActionKind) -> String {
     let client = http_client();
     match kind {
         ActionKind::ToggleLike { id, saved } => {
@@ -335,7 +333,7 @@ pub(crate) fn run_action(token: &str, kind: ActionKind) -> String {
 /// rejected as missing it.
 pub(crate) fn library_write(
     client: &reqwest::blocking::Client,
-    token: &str,
+    token: &Connection,
     remove: bool,
     uri: &str,
 ) -> Result<(), String> {
@@ -347,48 +345,28 @@ pub(crate) fn library_write(
     )
 }
 
-/// Returns Ok on 2xx, else a short reason (HTTP status / network) so the UI can
-/// say WHY instead of a generic "action failed". Retries once on 429.
+/// The daemon owns authorization, mutation routing and retry policy.
 pub(crate) fn api_modify(
-    client: &reqwest::blocking::Client,
-    token: &str,
+    _client: &reqwest::blocking::Client,
+    token: &Connection,
     method: &str,
     url: &str,
 ) -> Result<(), String> {
-    for attempt in 0..2 {
-        let req = match method {
-            "PUT" => client.put(url),
-            "DELETE" => client.delete(url),
-            _ => client.post(url),
-        };
-        match req.bearer_auth(token).header("Content-Length", "0").send() {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            Ok(r) if r.status().as_u16() == 429 && attempt == 0 => {
-                let wait = r
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(1)
-                    .min(5);
-                std::thread::sleep(Duration::from_secs(wait));
-            }
-            Ok(r) => return Err(format!("HTTP {}", r.status().as_u16())),
-            Err(e) => {
-                return Err(if e.is_timeout() {
-                    "timeout".into()
-                } else {
-                    "network error".into()
-                })
-            }
-        }
-    }
-    Err("rate limited".into())
+    let method = match method {
+        "PUT" => myx::webapi::HttpMethod::Put,
+        "DELETE" => myx::webapi::HttpMethod::Delete,
+        "POST" => myx::webapi::HttpMethod::Post,
+        _ => return Err("unsupported catalog action".into()),
+    };
+    token
+        .catalog(method, catalog_path(url), None)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Is `uri` in the user's library? Replaced the `/me/*/contains` family in
 /// February 2026; those are gone and answer 403.
-pub(crate) fn api_contains(token: &str, uri: &str) -> bool {
+pub(crate) fn api_contains(token: &Connection, uri: &str) -> bool {
     let client = http_client();
     let url = format!("{API}/me/library/contains?uris={}", urlencode(uri));
     get_json(&client, &url, token)

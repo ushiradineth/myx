@@ -10,11 +10,10 @@ pub(crate) fn spawn_library_fetch(
     tx: flume::Sender<(Section, Vec<LibItem>)>,
     done_tx: flume::Sender<bool>,
 ) {
-    // Clone the already-refreshed access token BEFORE spawning. This removes the
-    // shared WebApi mutex from the worker entirely (the stuck-library root cause).
-    let token_opt = token_of(&webapi);
+    // Clone the handle before spawning; never hold the UI mutex across IPC.
+    let token_opt = connection_of(&webapi);
     liblog(format!(
-        "spawn_library_fetch: token={}",
+        "spawn_library_fetch: connection={}",
         token_opt.as_ref().map_or("missing", |_| "ok")
     ));
     std::thread::Builder::new()
@@ -22,7 +21,7 @@ pub(crate) fn spawn_library_fetch(
         .spawn(move || {
             liblog("worker: entered");
             let Some(token) = token_opt else {
-                liblog("worker: no token; aborting");
+                liblog("worker: no daemon connection; aborting");
                 let _ = done_tx.send(false);
                 return;
             };
@@ -233,7 +232,7 @@ pub(crate) fn playlist_subtitle(owner: &str, total: Option<u64>) -> String {
 pub(crate) fn fetch_all_pages(
     client: &reqwest::blocking::Client,
     first_url: &str,
-    token: &str,
+    token: &Connection,
     nested: Option<&str>,
     max_pages: usize,
     parse: impl Fn(&serde_json::Value) -> Option<LibItem>,

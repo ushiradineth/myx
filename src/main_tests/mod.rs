@@ -6,10 +6,6 @@ mod playlist;
 mod search;
 mod theme;
 
-/// Live-API tests, `#[ignore]`d so `cargo test` stays offline:
-///
-///     cargo test --bin myx -- --ignored --nocapture
-///
-/// They catch Spotify changing an endpoint out from under the artist page,
-/// which is how the 403/400 pair that emptied it went unnoticed.
+/// Ignored read-only catalog scenarios require MYX_TEST_CONFIG and a ready,
+/// explicitly authorized test daemon. Missing setup is a failure, never a pass.
 mod live;

@@ -29,17 +29,6 @@ pub(crate) struct TrackImage {
     pub(crate) image: Option<image::DynamicImage>,
 }
 
-/// What kind of thing is currently playing — persisted so we can resume the real
-/// context (and its live queue) on reboot, not just a bare track.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub(crate) enum PlaySource {
-    #[default]
-    None,
-    Context(String), // playlist / album / artist URI
-    Radio(String),   // seed track URI
-    Liked,
-}
-
 /// The playhead: what's playing plus the coalesced Shift+arrow scrub state.
 ///
 /// These live together because every scrub method touches both — `seek_step`
@@ -70,9 +59,51 @@ pub(crate) fn scrub_target(from_ms: u32, duration_ms: u32, delta_ms: i64) -> u32
 }
 
 impl PlaybackState {
+    pub(crate) fn apply_snapshot(&mut self, snapshot: &Snapshot, timestamp_ms: u64) {
+        let mut updated = Self::from_snapshot(snapshot, timestamp_ms);
+        match (&mut updated.now, self.now.take()) {
+            (Some(next), Some(previous)) if next.uri == previous.uri => {
+                next.cover = previous.cover;
+                if self.seek_target.is_some() {
+                    next.position_ms = previous.position_ms;
+                    next.position_at = previous.position_at;
+                }
+            }
+            _ => self.seek_target = None,
+        }
+        self.now = updated.now;
+    }
+
+    pub(crate) fn from_snapshot(snapshot: &Snapshot, timestamp_ms: u64) -> Self {
+        let now = snapshot.track.as_ref().map(|track| NowPlaying {
+            uri: track.uri.clone(),
+            title: track.title.clone().unwrap_or_default(),
+            artist: track
+                .artists
+                .as_ref()
+                .map(|artists| artists.join(", "))
+                .unwrap_or_default(),
+            album: track.album.clone().unwrap_or_default(),
+            duration_ms: track.duration_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            position_ms: snapshot
+                .position
+                .at(timestamp_ms, track.duration_ms)
+                .min(u64::from(u32::MAX)) as u32,
+            position_at: Instant::now(),
+            is_playing: snapshot.playback == PlaybackStatus::Playing,
+            cover: None,
+        });
+        Self {
+            now,
+            seek_target: None,
+            seek_last_step: Instant::now(),
+            seek_last_input: Instant::now(),
+        }
+    }
+
     /// SDK text is available before cover HTTP finishes. Establish it now so
     /// the next engine position/state event always has a model to update.
-    pub(crate) fn apply_sdk_metadata(&mut self, meta: &myx::engine::TrackMetadata) {
+    pub(crate) fn apply_sdk_metadata(&mut self, meta: &TrackMetadata) {
         let position = self.position_ms();
         let previous = self.now.take().filter(|now| now.uri == meta.uri);
         let is_playing = previous.as_ref().is_some_and(|now| now.is_playing);
@@ -116,7 +147,7 @@ impl PlaybackState {
     }
     /// Move the progress bar, without telling the engine. Reports from the
     /// engine are ignored mid-scrub — what we painted is newer than anything
-    /// librespot has heard about.
+    /// the daemon has observed.
     pub(crate) fn set_local_position(&mut self, position_ms: u32, from_engine: bool) {
         if !should_apply_engine_position(from_engine, self.seek_target) {
             return;
@@ -127,7 +158,7 @@ impl PlaybackState {
         }
     }
     /// Seek to an absolute position (clamped), updating the local display too.
-    pub(crate) fn seek_to(&mut self, engine: &Engine, position_ms: u32) {
+    pub(crate) fn seek_to(&mut self, engine: &Player, position_ms: u32) {
         let Some(dur) = self.now.as_ref().map(|n| n.duration_ms) else {
             return;
         };
@@ -137,7 +168,7 @@ impl PlaybackState {
     }
     /// One Shift+arrow press, moving the playhead by `delta_ms`.
     ///
-    /// A seek per key repeat overshot the track and made librespot flush and
+    /// A seek per key repeat overshot the track and made playback flush and
     /// refill its audio buffer 30×/s — that pile-up was the stutter. Repeats are
     /// throttled and the engine seek deferred to `flush_seek`.
     pub(crate) fn seek_step(&mut self, delta_ms: i64) {
@@ -158,7 +189,7 @@ impl PlaybackState {
         self.set_local_position(target, false);
     }
     /// Commit a finished scrub as a single engine seek, once the keys stop.
-    pub(crate) fn flush_seek(&mut self, engine: &Engine, now: Instant) {
+    pub(crate) fn flush_seek(&mut self, engine: &Player, now: Instant) {
         if now.duration_since(self.seek_last_input) < SEEK_SETTLE {
             return;
         }
@@ -222,7 +253,7 @@ mod tests {
     #[test]
     fn sdk_metadata_exists_before_playback_events_and_cover_updates_keep_progress() {
         let mut playback = playing_at(10_000, Duration::from_secs(1));
-        let meta = myx::engine::TrackMetadata {
+        let meta = TrackMetadata {
             uri: "spotify:track:new".into(),
             title: "Song".into(),
             artist: "Artist".into(),

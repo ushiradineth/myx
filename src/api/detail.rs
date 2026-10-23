@@ -10,7 +10,7 @@ pub(crate) fn spawn_detail_fetch(
     tx: flume::Sender<(String, String, Vec<LibItem>)>,
 ) {
     tokio::task::spawn_blocking(move || {
-        if let Some(token) = token_of(&webapi) {
+        if let Some(token) = connection_of(&webapi) {
             let (title, items) = fetch_detail_blocking(&token, &uri, &name);
             let _ = tx.send((uri, title, items));
         }
@@ -21,7 +21,7 @@ pub(crate) fn spawn_detail_fetch(
 /// February 2026, so this searches instead — also popularity-ranked, ten max.
 pub(crate) fn artist_top_tracks(
     client: &reqwest::blocking::Client,
-    token: &str,
+    token: &Connection,
     id: &str,
     name: &str,
 ) -> Vec<LibItem> {
@@ -56,7 +56,7 @@ pub(crate) fn artist_top_tracks(
 /// a time — since February 2026 a larger page is a 400 "Invalid limit".
 pub(crate) fn artist_albums(
     client: &reqwest::blocking::Client,
-    token: &str,
+    token: &Connection,
     id: &str,
 ) -> Vec<LibItem> {
     let mut seen = std::collections::HashSet::new();
@@ -93,7 +93,11 @@ pub(crate) fn artist_albums(
     albums.into_iter().map(|(_, it)| it).collect()
 }
 
-pub(crate) fn fetch_detail_blocking(token: &str, uri: &str, name: &str) -> (String, Vec<LibItem>) {
+pub(crate) fn fetch_detail_blocking(
+    token: &Connection,
+    uri: &str,
+    name: &str,
+) -> (String, Vec<LibItem>) {
     let client = http_client();
     let mut parts = uri.split(':');
     parts.next(); // "spotify"

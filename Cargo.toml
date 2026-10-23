@@ -25,28 +25,25 @@ tui-textarea-2 = { version = "0.12", default-features = false, features = ["cros
 image = "0.25"
 color-thief = "0.2"
 
-# --- streaming backend (on by default; the single `myx` binary needs it) ---
-librespot-core = { version = "0.8.0", optional = true }
-librespot-connect = { version = "0.8.0", optional = true }
-librespot-playback = { version = "0.8.0", optional = true, default-features = false, features = ["native-tls", "rodio-backend"] }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
-flume = { version = "0.12", optional = true }
-rustfft = { version = "6", optional = true }
-reqwest = { version = "0.13", optional = true, default-features = false, features = ["blocking", "json", "native-tls"] }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
-base64 = { version = "0.22", optional = true }
-sha2 = { version = "0.10", optional = true }
-rand = { version = "0.9", optional = true }
-serde = { version = "1", optional = true, features = ["derive"] }
-serde_json = { version = "1", optional = true }
-anyhow = { version = "1", optional = true }
-open = { version = "5", optional = true }
-fs2 = { version = "0.4", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+flume = "0.12"
+rustfft = "6"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+open = "5"
+fs2 = "0.4"
+libc = "0.2"
 souvlaki = { version = "0.8.3", default-features = false, features = ["pollster", "zbus", "zvariant"] }
-toml = { version = "1", default-features = false, features = ["parse", "serde"], optional = true }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 log = { version = "0.4.33", features = ["std"] }
-tungstenite = { version = "0.28", optional = true, default-features = false, features = ["handshake"] }
-soloist-runtime = { path = "crates/soloist-runtime", optional = true }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+soloist-runtime = { path = "crates/soloist-runtime" }
 
 [target.'cfg(windows)'.dependencies]
 windows-win = "3.0.0"
@@ -55,61 +52,17 @@ windows-win = "3.0.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30.13"
 
-# Pins librespot-core's transitive `vergen` build-dep to a working version so a
-# fresh `cargo install` (which ignores Cargo.lock) resolves correctly.
-[build-dependencies]
-vergen = "=9.0.6"
-
 [dev-dependencies]
 tempfile = "3"
 
-[features]
-default = ["streaming", "mxc"]
-
-# Optional adapter. Selection is explicit in config/CLI; normal remains default.
-soloist = ["streaming", "dep:tungstenite", "dep:soloist-runtime"]
-
-# The Myx Color Protocol: pure data types + color math, usable without the
-# streaming backend so consumers can depend on the protocol half alone.
-mxc = ["dep:serde", "dep:serde_json"]
-streaming = [
-    "dep:librespot-core",
-    "dep:librespot-connect",
-    "dep:librespot-playback",
-    "dep:tokio",
-    "dep:flume",
-    "dep:rustfft",
-    "dep:reqwest",
-    "dep:rustls",
-    "dep:base64",
-    "dep:sha2",
-    "dep:rand",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:anyhow",
-    "dep:open",
-    "dep:fs2",
-    "dep:toml",
-]
-
-# The one, fully-wired binary. `required-features` states what was already
-# true — `main.rs` is unconditionally wired to the streaming engine — so that
-# a protocol-only build (`--no-default-features --features mxc`) skips the bin
-# instead of failing to compile it.
 [[bin]]
 name = "myx"
 path = "src/main.rs"
-required-features = ["streaming"]
 
 # Public theme/protocol examples.
 [[example]]
 name = "theme_demo"
 path = "examples/theme_demo.rs"
-
-[[example]]
-name = "mxc_demo"
-path = "examples/mxc_demo.rs"
-required-features = ["mxc"]
 
 [profile.release]
 lto = true

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
 pub struct Managed {
+    device_id: Option<String>,
     bonjour: Option<Bonjour>,
     sdk: Option<OwnedChild>,
     drains: Vec<Drain>,
@@ -43,6 +44,7 @@ impl Managed {
         config.data_dir = config.data_dir.canonicalize()?;
         config.cache_dir = config.cache_dir.canonicalize()?;
         let mut managed = Self {
+            device_id: None,
             bonjour: None,
             sdk: None,
             drains: Vec::new(),
@@ -153,6 +155,7 @@ impl Managed {
                 }
                 if let Some((pairing, ref identity)) = identity {
                     managed.bonjour = Some(Bonjour::register(pairing, identity, deadline)?);
+                    managed.device_id = Some(identity.clone());
                     process::remaining(deadline, Duration::from_secs(1))?;
                     ensure!(
                         managed.children_running(),
@@ -188,7 +191,15 @@ impl Managed {
         running
     }
 
+    pub fn device_id(&self) -> Result<&str> {
+        self.device_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .context("owned SDK device identity is unavailable")
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
+        self.device_id = None;
         self.bonjour.take();
         // Attempt both groups even if one fails. Keep the lock and scratch
         // until both stop, so explicit shutdown can be retried after errors.
@@ -353,6 +364,7 @@ mod tests {
         let path = scratch.path().to_owned();
         let lock = SessionLock::acquire(&data).unwrap();
         let mut managed = Managed {
+            device_id: Some("public-sdk-id".into()),
             bonjour: None,
             sdk: None,
             drains: Vec::new(),
@@ -361,6 +373,7 @@ mod tests {
             locks: vec![lock],
         };
         managed.shutdown().unwrap();
+        assert!(managed.device_id().is_err());
         managed.shutdown().unwrap();
         assert!(!path.exists());
         assert_eq!(std::fs::read(data.join("persistent")).unwrap(), b"keep");
@@ -381,6 +394,7 @@ mod tests {
         let runtime = crate::Runtime {
             endpoint: "ws://127.0.0.1:1".into(),
             managed: Managed {
+                device_id: None,
                 bonjour: None,
                 sdk: None,
                 drains: Vec::new(),

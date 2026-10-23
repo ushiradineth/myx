@@ -6,7 +6,7 @@ use crate::*;
 /// (the `Arc<Mutex<_>>` is only ever cloned), so grouping them costs no
 /// borrow flexibility.
 pub(crate) struct Services {
-    pub(crate) engine: Engine,
+    pub(crate) engine: Player,
     pub(crate) picker: Picker,
     pub(crate) webapi: Arc<Mutex<WebApi>>,
 }
@@ -66,25 +66,45 @@ impl ThemeState {
     }
 }
 
-/// Playback controls and the queue — everything the transport bar and the
-/// persisted `SavedState` care about. None of it touches the playhead.
+/// The daemon's transport read model, with optimistic local control feedback.
 pub(crate) struct Transport {
     pub(crate) shuffle: bool,
-    pub(crate) repeat: bool,
+    pub(crate) repeat: RepeatMode,
     pub(crate) volume: u8, // 0..=100 (mirrors the 50% mixer default)
     pub(crate) queue: Vec<String>,
     pub(crate) queue_uris: Vec<String>,
     // Whether real playback has started this session (gates resume-on-play).
     pub(crate) playback_started: bool,
-    // Audio was playing when the access point dropped, so the replacement
-    // Connect device should pick the source back up once it is ready.
-    pub(crate) resume_after_reconnect: bool,
-    // What's playing (context/radio/liked), for faithful resume on reboot.
-    pub(crate) source: PlaySource,
+    // Current browser request label, not playback restoration state.
     pub(crate) source_name: String,
-    /// Local DSP state. Kept with the transport controls because it affects the
-    /// audio path and is persisted alongside volume/shuffle/repeat.
+    /// Daemon DSP settings displayed by the equalizer controls.
     pub(crate) equalizer: EqualizerSettings,
+}
+
+impl Transport {
+    /// Attaching is a read. Only subsequent explicit input may send controls.
+    pub(crate) fn from_snapshot(snapshot: &Snapshot) -> Self {
+        Self {
+            shuffle: snapshot.shuffle,
+            repeat: snapshot.repeat,
+            volume: snapshot.volume,
+            queue: snapshot
+                .queue
+                .upcoming
+                .iter()
+                .map(|entry| entry.title.clone().unwrap_or_default())
+                .collect(),
+            queue_uris: snapshot
+                .queue
+                .upcoming
+                .iter()
+                .map(|entry| entry.uri.clone())
+                .collect(),
+            playback_started: snapshot.track.is_some(),
+            source_name: String::new(),
+            equalizer: snapshot.equalizer,
+        }
+    }
 }
 
 /// The library browser: what's loaded, where the cursor is, and the drill-in
@@ -151,7 +171,6 @@ pub(crate) struct EqualizerOverlay {
 /// Cross-cutting session bookkeeping: which metadata fetch is still in flight
 /// and the input timestamps that make Ctrl-C and double-click work.
 pub(crate) struct SessionState {
-    pub(crate) restore_uri: Option<String>,
     // Track URI whose metadata was last requested. Fetches run on separate
     // blocking tasks and can land out of order when skipping quickly, so a
     // reply for any other track is stale and must be dropped.

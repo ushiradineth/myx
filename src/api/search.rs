@@ -9,7 +9,7 @@ pub(crate) fn spawn_search(
     tx: flume::Sender<Vec<LibItem>>,
 ) {
     tokio::task::spawn_blocking(move || {
-        let results = match token_of(&webapi) {
+        let results = match connection_of(&webapi) {
             Some(token) => search_blocking(&token, &query),
             None => Vec::new(),
         };
@@ -17,7 +17,7 @@ pub(crate) fn spawn_search(
     });
 }
 
-pub(crate) fn search_blocking(token: &str, query: &str) -> Vec<LibItem> {
+pub(crate) fn search_blocking(token: &Connection, query: &str) -> Vec<LibItem> {
     let client = http_client();
     let url = format!(
         "{API}/search?q={}&type=track,artist,album,playlist&limit=6",

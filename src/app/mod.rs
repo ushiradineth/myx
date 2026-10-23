@@ -8,8 +8,8 @@
 //!
 //! It would be tidier if this module depended on none of the others, and it
 //! nearly does — with two exceptions, both in `event.rs`, where handling an
-//! engine event spawns a fetch directly (`fetch_track_meta`, and the lyrics
-//! fetch). Those reach into `api/`. The intended shape is for `event.rs` to
+//! player event spawns viewer artwork and lyrics work directly. Those
+//! reach into `api/`. The intended shape is for `event.rs` to
 //! send a request over a channel and let `main.rs` — the wiring layer, which is
 //! allowed to know both sides — service it. Until that lands, this is a real
 //! edge in the graph, not an aspiration, so don't add more of them.
@@ -18,7 +18,6 @@ mod action;
 mod event;
 mod frame;
 mod library;
-mod persist;
 mod playback;
 mod state;
 
@@ -26,26 +25,13 @@ pub(crate) use action::*;
 pub(crate) use event::*;
 pub(crate) use frame::*;
 pub(crate) use library::*;
-pub(crate) use persist::*;
 pub(crate) use playback::*;
 pub(crate) use state::*;
-
-use crate::*;
 
 pub(crate) struct App {
     pub(crate) svc: Services,
     pub(crate) theme: ThemeState,
     pub(crate) playback: PlaybackState,
-    // Best-effort OS integration. Headless/SSH sessions may not expose the
-    // platform media service, but that must never prevent Myx from playing.
-    pub(crate) media_controls: Option<MediaControls>,
-    // The MXC colour publisher, when one could be bound. `None` means
-    // publishing is disabled (`MYX_NO_COLOR_SOCKET`) or the bind failed — both
-    // are ordinary states, not errors: a player that refuses to play music
-    // because a socket is unavailable would be a worse player. Every use site
-    // is a `if let Some(..)`, so `None` is simply inert.
-    #[cfg(all(feature = "mxc", unix))]
-    pub(crate) mxc: Option<myx::mxc::publish::Publisher>,
     pub(crate) status: String,
     pub(crate) browse: BrowseState,
     pub(crate) transport: Transport,
@@ -113,14 +99,13 @@ impl App {
     }
     /// The single entry point for "play this context URI".
     ///
-    /// Every caller must route through here so `source` / `source_name` stay in
+    /// Every caller must route through here so `source_name` stays in
     /// sync with what is actually playing — they back the Queue view's
-    /// PLAYING FROM header and the resume-on-launch path in `resume_source`.
+    /// PLAYING FROM header.
     /// `name` is a parameter rather than being derived from `details.last()`
     /// because the drill-in stack is empty when playing straight from a list.
     pub(crate) fn play_context_row(&mut self, uri: String, name: String, shuffle: bool) {
         self.status = format!("starting {name}…");
-        self.transport.source = PlaySource::Context(uri.clone());
         self.transport.source_name = name;
         if let Err(e) = self.svc.engine.play_context(uri, shuffle) {
             self.status = format!("couldn't play: {e:#}");
@@ -148,7 +133,6 @@ impl App {
                     .map(|i| i.uri.clone())
                     .collect();
                 if !uris.is_empty() {
-                    self.transport.source = PlaySource::Liked;
                     self.transport.source_name = "Liked Songs".to_string();
                     self.status = "starting Liked Songs…".to_string();
                     // Honour the current shuffle toggle instead of a dedicated row.
@@ -176,39 +160,12 @@ impl App {
         }
         if item.is_track() {
             if self.search.searching {
-                if !self.svc.engine.capabilities().radio {
-                    self.play_context_row(item.uri, item.name, false);
-                    return Activated::None;
-                }
-                // A search-result song starts that song's radio (seed + similar).
-                self.transport.source = PlaySource::Radio(item.uri.clone());
-                self.transport.source_name = format!("Radio · {}", item.name);
-                return Activated::Radio(item.uri);
+                self.play_context_row(item.uri, item.name, false);
+                return Activated::None;
             }
             // Inside a drill-in → play its context at this track (real queue).
             if let Some(d) = self.browse.details.last() {
-                if self.svc.engine.is_soloist() {
-                    let tracks = d
-                        .items
-                        .iter()
-                        .filter(|row| row.is_track())
-                        .map(|row| row.uri.clone())
-                        .collect();
-                    self.transport.source = PlaySource::Context(d.context_uri.clone());
-                    self.transport.source_name = d.title.clone();
-                    self.status = format!("starting {}…", item.name);
-                    if let Err(error) = self.svc.engine.play_tracks(
-                        tracks,
-                        Some(item.uri),
-                        0,
-                        self.transport.shuffle,
-                    ) {
-                        self.status = format!("couldn't play: {error:#}");
-                    }
-                    return Activated::None;
-                }
                 let ctx = d.context_uri.clone();
-                self.transport.source = PlaySource::Context(ctx.clone());
                 self.transport.source_name = d.title.clone();
                 self.status = format!("starting {}…", item.name);
                 if let Err(e) = self.svc.engine.play_context_at(
@@ -230,10 +187,8 @@ impl App {
                 .collect();
             self.status = format!("starting {}…", item.name);
             if self.browse.section == Section::Liked {
-                self.transport.source = PlaySource::Liked;
                 self.transport.source_name = "Liked Songs".to_string();
             } else {
-                self.transport.source = PlaySource::None;
                 self.transport.source_name = self.browse.section.label().to_string();
             }
             if let Err(e) =

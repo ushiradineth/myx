@@ -4,19 +4,15 @@
 //! © 2021 Thang Pham). Decoupled here from that app's global state so it writes
 //! to a plain `Arc<Mutex<VisBands>>` that myx owns.
 //!
-//! The design is a **tee'd audio sink**: it forwards every packet it receives
-//! unchanged to the real backend while computing a windowed FFT on a copy. The
-//! equalizer sits immediately before this sink, so these bands describe the
-//! sound after EQ. The hot path is allocation-free and the UI reads the bands
+//! The managed PCM processor feeds post-EQ samples only while telemetry is
+//! requested. The hot path is allocation-free and the owner reads the bands
 //! via `try_lock`, so the audio thread never stalls waiting on a render.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use librespot_playback::audio_backend::{Sink, SinkResult};
-use librespot_playback::convert::Converter;
-use librespot_playback::decoder::AudioPacket;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 const FFT_SIZE: usize = 1024;
@@ -58,12 +54,6 @@ impl Default for VisBands {
     }
 }
 
-/// A tee'd sink: forwards audio to `inner` and computes FFT bands on the side.
-pub struct VisualizationSink {
-    inner: Box<dyn Sink>,
-    analyzer: SpectrumAnalyzer,
-}
-
 pub(crate) struct SpectrumAnalyzer {
     sample_buf: VecDeque<f32>,
     bands: Arc<Mutex<VisBands>>,
@@ -75,15 +65,8 @@ pub(crate) struct SpectrumAnalyzer {
     band_ranges: Vec<(usize, usize)>,
     new_bands: [f32; NUM_BANDS],
     smooth_scratch: [f32; NUM_BANDS],
-}
-
-impl VisualizationSink {
-    pub fn new(inner: Box<dyn Sink>, bands: Arc<Mutex<VisBands>>, sample_rate: f32) -> Self {
-        Self {
-            inner,
-            analyzer: SpectrumAnalyzer::new(bands, sample_rate),
-        }
-    }
+    #[cfg(test)]
+    fft_frames: usize,
 }
 
 impl SpectrumAnalyzer {
@@ -107,13 +90,20 @@ impl SpectrumAnalyzer {
             band_ranges,
             new_bands: [0.0; NUM_BANDS],
             smooth_scratch: [0.0; NUM_BANDS],
+            #[cfg(test)]
+            fft_frames: 0,
         }
     }
 }
 
 impl SpectrumAnalyzer {
+    #[cfg(test)]
+    pub(crate) fn fft_frames(&self) -> usize {
+        self.fft_frames
+    }
+
     pub(crate) fn reset(&mut self) {
-        if let Ok(mut g) = self.bands.lock() {
+        if let Ok(mut g) = self.bands.try_lock() {
             g.values.fill(0.0);
             g.peak_envelope = 1e-6;
             g.updated_at = Instant::now();
@@ -122,7 +112,10 @@ impl SpectrumAnalyzer {
         self.sample_buf.clear();
     }
 
-    pub(crate) fn process(&mut self, samples: &[f64]) {
+    pub(crate) fn process(&mut self, samples: &[f64], enabled: &AtomicBool) {
+        if !enabled.load(Ordering::Acquire) {
+            return;
+        }
         // Interleaved stereo -> mono.
         self.sample_buf.extend(samples.chunks(2).map(|c| {
             if c.len() == 2 {
@@ -163,6 +156,10 @@ impl SpectrumAnalyzer {
             }
 
             self.fft.process(&mut self.fft_buf);
+            #[cfg(test)]
+            {
+                self.fft_frames += 1;
+            }
 
             for (mag, c) in self.magnitudes.iter_mut().zip(self.fft_buf.iter()) {
                 *mag = c.norm();
@@ -172,6 +169,12 @@ impl SpectrumAnalyzer {
             smooth_bands(&mut self.new_bands, &mut self.smooth_scratch);
 
             if let Ok(mut g) = self.bands.try_lock() {
+                // Disabling demand clears shared telemetry under this same
+                // lock. Never publish a frame computed before detachment.
+                if !enabled.load(Ordering::Acquire) {
+                    self.sample_buf.clear();
+                    return;
+                }
                 let elapsed_hops =
                     g.updated_at.elapsed().as_secs_f32() * self.sample_rate / HOP_SIZE as f32;
                 let decay = DECAY_FACTOR.powf(elapsed_hops);
@@ -182,26 +185,11 @@ impl SpectrumAnalyzer {
                 }
                 g.peak_envelope = (g.peak_envelope * peak_decay).max(frame_peak);
                 g.updated_at = Instant::now();
+                g.is_active = true;
             }
 
             self.sample_buf.drain(..HOP_SIZE);
         }
-    }
-}
-
-impl Sink for VisualizationSink {
-    fn start(&mut self) -> SinkResult<()> {
-        self.inner.start()
-    }
-    fn stop(&mut self) -> SinkResult<()> {
-        self.analyzer.reset();
-        self.inner.stop()
-    }
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
-        if let AudioPacket::Samples(ref samples) = packet {
-            self.analyzer.process(samples);
-        }
-        self.inner.write(packet, converter)
     }
 }
 
