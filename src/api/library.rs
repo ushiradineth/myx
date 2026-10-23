@@ -1,263 +1,166 @@
-//! The library sections: home, recent, playlists, albums, artists, liked.
-
+//! Demand-driven, all-page user collections. Failed collections never publish partial rows.
 use super::*;
 use crate::*;
 
-/// Fetch the library incrementally: fast sections first, Liked streamed in
-/// chunks so the UI is usable within ~1s instead of waiting for everything.
-pub(crate) fn spawn_library_fetch(
-    webapi: Arc<Mutex<WebApi>>,
-    tx: flume::Sender<(Section, Vec<LibItem>)>,
-    done_tx: flume::Sender<bool>,
-) {
-    // Clone the handle before spawning; never hold the UI mutex across IPC.
-    let token_opt = connection_of(&webapi);
-    liblog(format!(
-        "spawn_library_fetch: connection={}",
-        token_opt.as_ref().map_or("missing", |_| "ok")
-    ));
-    std::thread::Builder::new()
-        .name("myx-library".to_string())
-        .spawn(move || {
-            liblog("worker: entered");
-            let Some(token) = token_opt else {
-                liblog("worker: no daemon connection; aborting");
-                let _ = done_tx.send(false);
-                return;
-            };
-
-            let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(12))
-                .build()
-                .expect("build library HTTP client");
-            let mut got_any = false;
-            let track_from = |t: &serde_json::Value| -> Option<LibItem> {
-                Some(LibItem::track(
-                    t["name"].as_str()?.to_string(),
-                    t["artists"][0]["name"].as_str().unwrap_or("").to_string(),
-                    t["uri"].as_str()?.to_string(),
-                ))
-            };
-            let artist_from = |a: &serde_json::Value| -> Option<LibItem> {
-                Some(LibItem::ctx(
-                    a["name"].as_str()?.to_string(),
-                    String::new(),
-                    a["uri"].as_str()?.to_string(),
-                ))
-            };
-            let album_from = |a: &serde_json::Value| -> Option<LibItem> {
-                Some(LibItem::ctx(
-                    a["name"].as_str()?.to_string(),
-                    format!("album · {}", a["artists"][0]["name"].as_str().unwrap_or("")),
-                    a["uri"].as_str()?.to_string(),
-                ))
-            };
-
-            // Home: a curated mix — recently played, top tracks, top artists, new releases.
-            liblog("worker: fetching home/recent");
-            let mut home: Vec<LibItem> = Vec::new();
-            let recent5 = fetch_all_pages(
-                &client,
-                &format!("{API}/me/player/recently-played?limit=10"),
-                &token,
-                None,
-                1,
-                |it| track_from(&it["track"]),
-            );
-            if !recent5.is_empty() {
-                home.push(LibItem::header("Recently Played"));
-                home.extend(recent5.into_iter().take(6));
-            }
-            let top_tracks = fetch_all_pages(
-                &client,
-                &format!("{API}/me/top/tracks?limit=10"),
-                &token,
-                None,
-                1,
-                |t| track_from(t),
-            );
-            if !top_tracks.is_empty() {
-                home.push(LibItem::header("Your Top Tracks"));
-                home.extend(top_tracks.into_iter().take(8));
-            }
-            let top_artists = fetch_all_pages(
-                &client,
-                &format!("{API}/me/top/artists?limit=10"),
-                &token,
-                None,
-                1,
-                |a| artist_from(a),
-            );
-            if !top_artists.is_empty() {
-                home.push(LibItem::header("Your Top Artists"));
-                home.extend(top_artists.into_iter().take(6));
-            }
-            // `/browse/new-releases` was removed in February 2026.
-            got_any |= !home.is_empty();
-            liblog(format!("worker: home done, {} rows", home.len()));
-            let _ = tx.send((Section::Home, home));
-
-            let recent = fetch_all_pages(
-                &client,
-                &format!("{API}/me/player/recently-played?limit=50"),
-                &token,
-                None,
-                1,
-                |it| track_from(&it["track"]),
-            );
-            got_any |= !recent.is_empty();
-            let _ = tx.send((Section::Recent, recent));
-
-            let playlists = fetch_all_pages(
-                &client,
-                &format!("{API}/me/playlists?limit=50"),
-                &token,
-                None,
-                10,
-                |it| {
-                    Some(LibItem::ctx(
-                        it["name"].as_str()?.to_string(),
-                        playlist_subtitle(
-                            it["owner"]["display_name"].as_str().unwrap_or(""),
-                            playlist_total(it),
-                        ),
-                        it["uri"].as_str()?.to_string(),
-                    ))
-                },
-            );
-            got_any |= !playlists.is_empty();
-            let _ = tx.send((Section::Playlists, playlists));
-
-            let albums = fetch_all_pages(
-                &client,
-                &format!("{API}/me/albums?limit=50"),
-                &token,
-                None,
-                10,
-                |it| album_from(&it["album"]),
-            );
-            got_any |= !albums.is_empty();
-            let _ = tx.send((Section::Albums, albums));
-
-            let artists = fetch_all_pages(
-                &client,
-                &format!("{API}/me/following?type=artist&limit=50"),
-                &token,
-                Some("artists"),
-                5,
-                |it| artist_from(it),
-            );
-            got_any |= !artists.is_empty();
-            let _ = tx.send((Section::Artists, artists));
-
-            // Liked can be huge — stream it in as pages arrive so the count climbs live.
-            // Prepend Shuffle/Play action rows (shuffle first).
-            let mut liked: Vec<LibItem> = vec![
-                LibItem::play("▶︎  Play Liked Songs".into(), "myx:action:liked-play".into()),
-                LibItem::header("Songs"),
-            ];
-            let mut url = Some(format!("{API}/me/tracks?limit=50"));
-            let mut pages = 0;
-            while let Some(u) = url.take() {
-                if pages >= 100 {
-                    break;
-                }
-                let Some(v) = get_json(&client, &u, &token) else {
-                    break;
-                };
-                for it in v["items"].as_array().into_iter().flatten() {
-                    if let Some(li) = track_from(&it["track"]) {
-                        liked.push(li);
-                    }
-                }
-                url = v["next"].as_str().map(String::from);
-                pages += 1;
-                if pages % 3 == 0 {
-                    let _ = tx.send((Section::Liked, liked.clone()));
-                }
-            }
-            got_any |= liked.len() > 2; // beyond the two action rows
-            let _ = tx.send((Section::Liked, liked));
-
-            liblog(format!("worker: all done got_any={got_any}"));
-            let _ = done_tx.send(got_any);
-        })
-        .expect("spawn library worker");
+pub(crate) struct LibraryReply {
+    pub(crate) section: Section,
+    pub(crate) reply: Reply<Vec<LibItem>>,
 }
 
-/// One `/playlists/{id}/items` entry -> `LibItem`.
-///
-/// The payload nests the track under `item`; the older `/tracks` endpoint used
-/// `track`. Both are accepted so this keeps working whichever shape is served.
-///
-/// `None` skips the row (`fetch_all_pages` filters rather than aborting), which
-/// is what we want for entries with no playable track: `null` for items removed
-/// from the catalogue, and region-locked or malformed rows.
-pub(crate) fn parse_playlist_track(it: &serde_json::Value) -> Option<LibItem> {
-    let t = if it["item"].is_object() {
-        &it["item"]
-    } else {
-        &it["track"]
-    };
+pub(crate) fn spawn_library_fetch(
+    webapi: Arc<Mutex<WebApi>>,
+    section: Section,
+    id: u64,
+    tx: flume::Sender<LibraryReply>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result =
+            connection_of(&webapi).and_then(|connection| fetch_section(&connection, section));
+        let _ = tx.send(LibraryReply {
+            section,
+            reply: Reply { id, result },
+        });
+    });
+}
+
+pub(crate) fn track_row(track: &serde_json::Value) -> Option<LibItem> {
     Some(LibItem::track(
-        t["name"].as_str()?.to_string(),
-        t["artists"][0]["name"].as_str().unwrap_or("").to_string(),
-        t["uri"].as_str()?.to_string(),
+        track["name"].as_str()?.into(),
+        track["artists"]
+            .as_array()
+            .map(|artists| {
+                artists
+                    .iter()
+                    .filter_map(|artist| artist["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .or_else(|| track["show"]["publisher"].as_str().map(String::from))
+            .unwrap_or_default(),
+        track["uri"].as_str()?.into(),
     ))
 }
 
-/// Track count from a playlist object. Spotify renamed the field `tracks` ->
-/// `items` alongside the `/tracks` -> `/items` endpoint move; read the new name
-/// first and fall back so both shapes work.
-pub(crate) fn playlist_total(p: &serde_json::Value) -> Option<u64> {
-    p["items"]["total"]
-        .as_u64()
-        .or_else(|| p["tracks"]["total"].as_u64())
+pub(crate) fn context_row(value: &serde_json::Value) -> Option<LibItem> {
+    Some(LibItem::ctx(
+        value["name"].as_str()?.into(),
+        value["artists"][0]["name"].as_str().unwrap_or("").into(),
+        value["uri"].as_str()?.into(),
+    ))
 }
 
-/// Playlist row subtitle: `"142 · owner"`, or just the owner when the API omits
-/// the count.
-///
-/// Count first, deliberately: the row renderer truncates the subtitle tail-first
-/// in a narrow pane, and the count is both short and the more informative half —
-/// the owner is frequently the same name on every row.
-pub(crate) fn playlist_subtitle(owner: &str, total: Option<u64>) -> String {
-    match total {
-        Some(n) if owner.is_empty() => n.to_string(),
-        Some(n) => format!("{n} · {owner}"),
-        None => owner.to_string(),
-    }
+pub(crate) fn fetch_section(
+    connection: &Connection,
+    section: Section,
+) -> FetchResult<Vec<LibItem>> {
+    fetch_section_with(|path| get_json(connection, path), section)
 }
 
-pub(crate) fn fetch_all_pages(
-    client: &reqwest::blocking::Client,
-    first_url: &str,
-    token: &Connection,
-    nested: Option<&str>,
-    max_pages: usize,
-    parse: impl Fn(&serde_json::Value) -> Option<LibItem>,
-) -> Vec<LibItem> {
-    let mut out = Vec::new();
-    let mut url = Some(first_url.to_string());
-    let mut pages = 0;
-    while let Some(u) = url.take() {
-        if pages >= max_pages {
-            break;
+pub(crate) fn fetch_section_with(
+    mut fetch: impl FnMut(&str) -> FetchResult<serde_json::Value>,
+    section: Section,
+) -> FetchResult<Vec<LibItem>> {
+    let mut collect = |path: &str, container: Option<&str>| {
+        myx::webapi::catalog::collect_pages(&mut fetch, path, container)
+    };
+    let rows = match section {
+        Section::Home => {
+            let mut rows = Vec::new();
+            let recent: Vec<_> =
+                collect(&format!("{API}/me/player/recently-played?limit=50"), None)?
+                    .iter()
+                    .filter_map(|entry| track_row(&entry["track"]))
+                    .collect();
+            if !recent.is_empty() {
+                rows.push(LibItem::header("Recently Played"));
+                rows.extend(recent);
+            }
+            for (title, kind) in [
+                ("Your Top Tracks", "tracks"),
+                ("Your Top Artists", "artists"),
+            ] {
+                let values = collect(&format!("{API}/me/top/{kind}?limit=50"), None)?;
+                let group: Vec<_> = values
+                    .iter()
+                    .filter_map(if kind == "tracks" {
+                        track_row
+                    } else {
+                        context_row
+                    })
+                    .collect();
+                if !group.is_empty() {
+                    rows.push(LibItem::header(title));
+                    rows.extend(group);
+                }
+            }
+            rows
         }
-        let Some(v) = get_json(client, &u, token) else {
-            break;
-        };
-        let node = match nested {
-            Some(k) => &v[k],
-            None => &v,
-        };
-        for it in node["items"].as_array().into_iter().flatten() {
-            if let Some(li) = parse(it) {
-                out.push(li);
+        Section::Recent => collect(&format!("{API}/me/player/recently-played?limit=50"), None)?
+            .iter()
+            .filter_map(|entry| track_row(&entry["track"]))
+            .collect(),
+        Section::Playlists => collect(&format!("{API}/me/playlists?limit=50"), None)?
+            .iter()
+            .filter_map(|value| {
+                Some(LibItem::ctx(
+                    value["name"].as_str()?.into(),
+                    playlist_subtitle(
+                        value["owner"]["display_name"].as_str().unwrap_or(""),
+                        playlist_total(value),
+                    ),
+                    value["uri"].as_str()?.into(),
+                ))
+            })
+            .collect(),
+        Section::Albums => collect(&format!("{API}/me/albums?limit=50"), None)?
+            .iter()
+            .filter_map(|entry| context_row(&entry["album"]))
+            .collect(),
+        Section::Artists => collect(
+            &format!("{API}/me/following?type=artist&limit=50"),
+            Some("artists"),
+        )?
+        .iter()
+        .filter_map(context_row)
+        .collect(),
+        Section::Liked => {
+            let tracks: Vec<_> = collect(&format!("{API}/me/tracks?limit=50"), None)?
+                .iter()
+                .filter_map(|entry| track_row(&entry["track"]))
+                .collect();
+            if tracks.is_empty() {
+                Vec::new()
+            } else {
+                let mut rows = vec![
+                    LibItem::play("▶︎  Play Liked Songs".into(), "myx:action:liked-play".into()),
+                    LibItem::header("Songs"),
+                ];
+                rows.extend(tracks);
+                rows
             }
         }
-        url = node["next"].as_str().map(String::from);
-        pages += 1;
+    };
+    Ok(rows)
+}
+
+pub(crate) fn parse_playlist_track(entry: &serde_json::Value) -> Option<LibItem> {
+    track_row(if entry["item"].is_object() {
+        &entry["item"]
+    } else {
+        &entry["track"]
+    })
+}
+
+pub(crate) fn playlist_total(value: &serde_json::Value) -> Option<u64> {
+    value["items"]["total"]
+        .as_u64()
+        .or_else(|| value["tracks"]["total"].as_u64())
+}
+
+pub(crate) fn playlist_subtitle(owner: &str, total: Option<u64>) -> String {
+    match total {
+        Some(count) if owner.is_empty() => count.to_string(),
+        Some(count) => format!("{count} · {owner}"),
+        None => owner.into(),
     }
-    out
 }

@@ -187,3 +187,15 @@ fn native_and_client_play_toggle_share_explicit_restore_policy() {
         PlayerCommand::Pause
     ));
 }
+
+#[test]
+fn losing_account_ownership_freezes_the_previous_playing_anchor() {
+    let mut snapshot = Snapshot::starting("/config".into(), "Device".into());
+    snapshot.playback = PlaybackStatus::Playing;
+    snapshot.soloist_ready = true;
+    snapshot.position.speed = 1.0;
+    snapshot.owned_device_verified = false;
+    reducer::readiness(&mut snapshot);
+    assert_eq!(snapshot.playback, PlaybackStatus::Disconnected);
+    assert_eq!(snapshot.position.speed, 0.0);
+}

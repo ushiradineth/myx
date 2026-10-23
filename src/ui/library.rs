@@ -43,6 +43,20 @@ pub(crate) fn render_library(
                 Style::default().fg(theme.text.into()),
             ),
             Span::styled("  (Esc)", theme.muted()),
+            Span::styled(
+                app.session
+                    .search_error
+                    .as_ref()
+                    .map(|error| format!(" · previous results: {error}"))
+                    .or_else(|| {
+                        app.session
+                            .search_notice
+                            .clone()
+                            .map(|notice| format!(" · {notice}"))
+                    })
+                    .unwrap_or_default(),
+                theme.muted(),
+            ),
         ])
     } else {
         let mut spans = vec![
@@ -54,7 +68,10 @@ pub(crate) fn render_library(
                     "  {}/{} · {}",
                     app.browse.section.index() + 1,
                     Section::ALL.len(),
-                    app.cur_items().len()
+                    app.cur_items()
+                        .iter()
+                        .filter(|item| !item.is_header() && !item.is_play())
+                        .count()
                 ),
                 theme.muted(),
             ),
@@ -63,6 +80,12 @@ pub(crate) fn render_library(
             spans.push(Span::styled(
                 format!("  ⇅{}", app.browse.sort.label()),
                 Style::default().fg(theme.accent.into()),
+            ));
+        }
+        if let Some(error) = app.browse.library.error(app.browse.section) {
+            spans.push(Span::styled(
+                format!(" · {error}; previous rows retained"),
+                theme.muted(),
             ));
         }
         Line::from(spans)
@@ -93,6 +116,16 @@ pub(crate) fn render_library(
             app.search.in_flight,
             app.browse.library.is_loaded(app.browse.section),
         );
+        let error = if app.search.searching {
+            app.session.search_error.as_ref()
+        } else if app.browse.details.is_empty() {
+            app.browse.library.error(app.browse.section)
+        } else {
+            None
+        };
+        let label = error
+            .map(|error| format!("{error}; reload to retry"))
+            .unwrap_or_else(|| label.into());
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(label, theme.muted())))
                 .block(Block::default().style(theme.panel())),

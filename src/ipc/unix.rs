@@ -21,6 +21,8 @@ impl RuntimePaths {
         Ok(Self::in_directory(home.join(".cache/myx/daemon")))
     }
     pub fn in_directory(directory: PathBuf) -> Self {
+        // Keep the bootstrap path stable across protocol upgrades; frames
+        // negotiate VERSION so a changed path cannot hide a running owner.
         Self {
             socket: directory.join("daemon-v1.sock"),
             startup_lock: directory.join("startup.lock"),

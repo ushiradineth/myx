@@ -102,3 +102,36 @@ fn simultaneous_starts_have_one_locked_endpoint() {
     drop((first, second));
     assert!(!paths.socket.exists());
 }
+
+#[test]
+fn an_oversized_mutation_reply_is_uncertain_not_a_safe_to_retry_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::in_directory(root.path().canonicalize().unwrap().join("owner"));
+    let value = serde_json::json!({"large":"x".repeat(protocol::MAX_FRAME)});
+    let handler = Arc::new(move |_| Ok(Payload::Json(value.clone())));
+    let _owner = Server::bind(paths.clone(), "/test/config".into(), handler).unwrap();
+    let mut stream = UnixStream::connect(&paths.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    protocol::send(
+        &mut stream,
+        &Request {
+            protocol_version: VERSION,
+            request_id: 7,
+            config_path: Some("/test/config".into()),
+            operation: Operation::Catalog {
+                method: myx::webapi::HttpMethod::Post,
+                path: "/v1/me/library".into(),
+                body: None,
+            },
+        },
+    )
+    .unwrap();
+    let response: Response = protocol::receive(&mut stream).unwrap();
+    assert_eq!(response.request_id, 7);
+    match response.result {
+        Err(error) => assert_eq!(error.code, ErrorCode::WriteUncertain),
+        Ok(_) => panic!("an oversized reply cannot certify the write outcome"),
+    }
+}

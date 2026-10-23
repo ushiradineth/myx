@@ -21,12 +21,11 @@ const ARTIST_NAME: &str = "girl in red";
 #[ignore = "requires an explicitly authorized test daemon and Spotify catalog"]
 fn live_liked_songs_page_all_the_way_through() {
     let connection = connection();
-    let client = http_client();
     let mut url = Some(format!("{API}/me/tracks?limit=50"));
     let mut tracks = 0;
     let mut total = None;
     while let Some(page) = url.take() {
-        let value = get_json(&client, &page, &connection).expect("liked catalog page");
+        let value = get_json(&connection, &page).expect("liked catalog page");
         total.get_or_insert(value["total"].as_u64().expect("liked total"));
         tracks += value["items"].as_array().expect("liked items").len();
         url = value["next"].as_str().map(String::from);
@@ -37,7 +36,9 @@ fn live_liked_songs_page_all_the_way_through() {
 #[test]
 #[ignore = "requires an explicitly authorized test daemon and Spotify catalog"]
 fn live_artist_track_results_are_not_empty() {
-    let rows = artist_top_tracks(&http_client(), &connection(), ARTIST_ID, ARTIST_NAME);
+    let connection = connection();
+    let rows = artist_top_tracks(|path| get_json(&connection, path), ARTIST_ID)
+        .expect("authorized Popular endpoint");
     assert!(!rows.is_empty(), "artist track results unavailable");
     assert!(rows.iter().all(|row| row.is_track()));
 }
@@ -45,7 +46,9 @@ fn live_artist_track_results_are_not_empty() {
 #[test]
 #[ignore = "requires an explicitly authorized test daemon and Spotify catalog"]
 fn live_artist_albums_page_past_the_first_ten() {
-    let rows = artist_albums(&http_client(), &connection(), ARTIST_ID);
+    let connection = connection();
+    let rows = artist_albums(|path| get_json(&connection, path), ARTIST_ID)
+        .expect("authorized complete discography");
     assert!(rows.len() > 10, "expected a paged discography");
     assert!(rows.iter().all(|row| !row.is_track() && !row.is_header()));
     let years: Vec<&str> = rows.iter().map(|row| row.subtitle.as_str()).collect();
@@ -55,16 +58,22 @@ fn live_artist_albums_page_past_the_first_ten() {
 #[test]
 #[ignore = "requires an explicitly authorized test daemon and Spotify catalog"]
 fn live_artist_detail_has_both_sections() {
-    let (_, items) = fetch_detail_blocking(
+    let detail = fetch_detail_blocking(
         &connection(),
         &format!("spotify:artist:{ARTIST_ID}"),
         ARTIST_NAME,
-    );
+    )
+    .expect("artist detail");
+    let items = detail.items;
     let headers: Vec<&str> = items
         .iter()
         .filter(|item| item.is_header())
         .map(|item| item.name.as_str())
         .collect();
-    assert_eq!(headers, ["Popular", "Albums"]);
+    assert!(headers.contains(&"Albums"));
+    assert!(
+        headers.contains(&"Popular") || detail.notice.is_some(),
+        "Popular failure must be explicit"
+    );
     assert!(items.len() > 20);
 }

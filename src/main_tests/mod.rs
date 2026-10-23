@@ -1,6 +1,7 @@
 //! The binary's unit tests, kept in the crate (not `tests/`) because they
 //! exercise items that are private to `main.rs`.
 
+mod catalog;
 mod nav;
 mod playlist;
 mod search;

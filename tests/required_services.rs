@@ -25,6 +25,7 @@ fn readiness_requires_both_services_and_verified_device_not_a_friendly_name() {
     assert!(!verify_owned_device(&devices, "Same Name"));
     assert!(verify_owned_device(&devices, "owned"));
     snapshot.owned_device_verified = true;
+    snapshot.catalog_available = true;
     reducer::readiness(&mut snapshot);
     assert_eq!(snapshot.readiness, ServiceState::Ready);
     assert_ne!(snapshot.playback, PlaybackStatus::Playing);

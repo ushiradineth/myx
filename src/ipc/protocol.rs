@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::domain::{PlayerCommand, Snapshot};
 use crate::webapi::HttpMethod;
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_FRAME: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -71,12 +71,16 @@ pub enum ErrorCode {
     RateLimited,
     Timeout,
     Internal,
+    WriteUncertain,
+    CollectionChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcError {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
 }
 
 impl IpcError {
@@ -84,6 +88,7 @@ impl IpcError {
         Self {
             code,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 }

@@ -136,6 +136,7 @@ fn serve(mut stream: UnixStream, config: &str, handler: &Arc<Handler>) {
     let Ok(request) = protocol::receive::<Request>(&mut stream) else {
         return;
     };
+    let mutation = matches!(&request.operation, Operation::Catalog { method, .. } if *method != crate::webapi::HttpMethod::Get);
     let result = if request.protocol_version != VERSION {
         Err(IpcError::new(
             ErrorCode::VersionMismatch,
@@ -164,15 +165,22 @@ fn serve(mut stream: UnixStream, config: &str, handler: &Arc<Handler>) {
     {
         // Framing validates size before any write, so only that error permits a
         // small typed reply. A partial I/O failure must never be replayed.
+        let code = if mutation {
+            ErrorCode::WriteUncertain
+        } else {
+            ErrorCode::InvalidRequest
+        };
+        let message = if mutation {
+            "Write outcome cannot be delivered; reconcile state before retrying"
+        } else {
+            "Reply exceeds IPC limit; request a smaller collection page"
+        };
         let _ = protocol::send(
             &mut stream,
             &Response {
                 protocol_version: VERSION,
                 request_id: response.request_id,
-                result: Err(IpcError::new(
-                    ErrorCode::InvalidRequest,
-                    "Reply exceeds IPC limit; request a smaller collection page",
-                )),
+                result: Err(IpcError::new(code, message)),
             },
         );
     }

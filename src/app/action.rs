@@ -1,7 +1,7 @@
 //! The context actions overlay: what an entry does and what's on the menu.
 
 /// What an action-menu entry does when activated.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum ActionKind {
     ToggleLike {
         id: String,
@@ -27,6 +27,7 @@ pub(crate) enum ActionKind {
     },
     FollowPlaylist {
         id: String,
+        following: bool,
     },
     Play {
         uri: String,

@@ -1,4 +1,5 @@
 //! Sole per-user owner of authorization, SDK, processed audio and native media.
+mod api_gate;
 mod lifecycle;
 pub mod server;
 
@@ -33,6 +34,7 @@ struct Shared {
     changed: Condvar,
     shutdown: Arc<AtomicBool>,
     api: Mutex<Option<ApiClient>>,
+    api_gate: Arc<api_gate::ApiGate>,
     device: Mutex<Option<String>>,
     subscriptions: Mutex<HashMap<String, (Instant, bool)>>,
     oauth: AtomicBool,
@@ -41,6 +43,59 @@ struct Shared {
 }
 
 impl Shared {
+    fn api_call(
+        &self,
+        generation: u64,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, ApiError> {
+        let _permit = self.api_gate.enter(Duration::from_secs(3))?;
+        let mut api = self
+            .api
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.load(Ordering::Acquire)
+            || self.generation.load(Ordering::Acquire) != generation
+        {
+            return Err(ApiError::Busy);
+        }
+        let result = api
+            .as_mut()
+            .ok_or(ApiError::Unauthorized)?
+            .request(method, path, body);
+        drop(api);
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Err(if method == HttpMethod::Get {
+                ApiError::Busy
+            } else {
+                ApiError::AmbiguousWrite
+            });
+        }
+        result
+    }
+    fn api_failure(&self, error: &ApiError) {
+        if !matches!(
+            error,
+            ApiError::Unauthorized
+                | ApiError::Offline
+                | ApiError::Server
+                | ApiError::InvalidResponse
+                | ApiError::AmbiguousWrite
+                | ApiError::RateLimited { .. }
+                | ApiError::Quota
+        ) {
+            return;
+        }
+        self.update(|snapshot| {
+            snapshot.catalog_available = false;
+            if *error == ApiError::Unauthorized {
+                snapshot.web_api_ready = false;
+            }
+            reducer::readiness(snapshot);
+            snapshot.message = Some(error.to_string());
+        });
+    }
     fn update(&self, edit: impl FnOnce(&mut Snapshot)) {
         let mut snapshot = self
             .snapshot
@@ -143,30 +198,16 @@ impl Shared {
                         "Playback writes must use serialized typed player commands",
                     ));
                 }
-                let result = {
-                    let mut api = self
-                        .api
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    api.as_mut()
-                        .ok_or_else(|| {
-                            IpcError::new(
-                                ErrorCode::SetupRequired,
-                                "Web API authorization is required",
-                            )
-                        })?
-                        .request(method, &path, body)
-                };
+                let generation = self.generation.load(Ordering::Acquire);
+                let result = self.api_call(generation, method, &path, body);
+                if self.generation.load(Ordering::Acquire) != generation {
+                    return Err(IpcError::new(if method == HttpMethod::Get { ErrorCode::SetupRequired } else { ErrorCode::WriteUncertain },
+                        "Authorization changed during this operation; reconcile state before retrying"));
+                }
                 match result {
                     Ok(value) => Ok(Payload::Json(value)),
                     Err(error) => {
-                        if error == ApiError::Unauthorized {
-                            self.update(|snapshot| {
-                                snapshot.web_api_ready = false;
-                                reducer::readiness(snapshot);
-                                snapshot.message = Some(error.to_string());
-                            });
-                        }
+                        self.api_failure(&error);
                         Err(api_error(error))
                     }
                 }
@@ -187,14 +228,28 @@ impl Shared {
         }
     }
     fn authorize(self: &Arc<Self>) -> Result<Payload, IpcError> {
+        let state = self.snapshot();
+        if state.readiness == ServiceState::Starting && !state.web_api_ready {
+            return Err(IpcError::new(
+                ErrorCode::Busy,
+                "Initial authorization checks are still running",
+            ));
+        }
         if self.oauth.swap(true, Ordering::AcqRel) {
             return Err(IpcError::new(
                 ErrorCode::Busy,
                 "An authorization flow is already pending",
             ));
         }
-        let flow =
-            configured_client_id().and_then(|id| AuthorizationFlow::begin(id, cache_path()?));
+        let flow = (|| {
+            let current = Config::load_path(&PathBuf::from(self.snapshot().config_path))?;
+            let id = std::env::var("MYX_CLIENT_ID")
+                .ok()
+                .filter(|id| !id.is_empty())
+                .or(current.client_id)
+                .context("Configure a Web API client_id")?;
+            AuthorizationFlow::begin(id, cache_path()?)
+        })();
         let flow = match flow {
             Ok(flow) => flow,
             Err(_) => {
@@ -209,17 +264,29 @@ impl Shared {
             .spawn(move || {
                 match flow.wait(&shared.shutdown) {
                     Ok(auth) => {
+                        let mut api = shared
+                            .api
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if auth.commit_cache().is_err() {
+                            drop(api);
+                            shared.update(|snapshot| snapshot.message=Some("Authorization cache commit failed; inspect the private cache before retrying setup".into()));
+                            shared.oauth.store(false,Ordering::Release);
+                            return;
+                        }
                         shared.generation.fetch_add(1, Ordering::AcqRel);
-                        shared.update(|snapshot| snapshot.owned_device_verified = false);
+                        shared.update(|snapshot| {
+                            snapshot.auth_revision = snapshot.auth_revision.saturating_add(1);
+                            snapshot.owned_device_verified = false;
+                            snapshot.catalog_available = false;
+                            reducer::readiness(snapshot);
+                        });
                         *shared
                             .device
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                        *shared
-                            .api
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(ApiClient::new(auth));
+                        *api = Some(ApiClient::new(auth));
+                        drop(api);
                         shared.update(|snapshot| {
                             snapshot.web_api_ready = true;
                             snapshot.readiness = ServiceState::Starting;
@@ -257,18 +324,26 @@ fn cache_path() -> Result<PathBuf> {
         .join(".cache/myx/webapi.json"))
 }
 fn api_error(error: ApiError) -> IpcError {
+    let retry_after_secs = match &error {
+        ApiError::RateLimited { retry_after_secs } => *retry_after_secs,
+        _ => None,
+    };
     let code = match error {
+        ApiError::Busy => ErrorCode::Busy,
         ApiError::Unauthorized => ErrorCode::Unauthorized,
         ApiError::Restricted | ApiError::DeviceNotOwned => ErrorCode::Restricted,
         ApiError::NotFound => ErrorCode::NotFound,
         ApiError::Quota => ErrorCode::Quota,
         ApiError::RateLimited { .. } => ErrorCode::RateLimited,
         ApiError::InvalidRequest => ErrorCode::InvalidRequest,
+        ApiError::AmbiguousWrite => ErrorCode::WriteUncertain,
+        ApiError::CollectionChanged => ErrorCode::CollectionChanged,
         _ => ErrorCode::Unavailable,
     };
     IpcError {
         code,
         message: error.to_string(),
+        retry_after_secs,
     }
 }
 
@@ -285,6 +360,7 @@ pub fn run() -> Result<()> {
         changed: Condvar::new(),
         shutdown: Arc::new(AtomicBool::new(false)),
         api: Mutex::new(None),
+        api_gate: Arc::new(api_gate::ApiGate::default()),
         device: Mutex::new(None),
         subscriptions: Mutex::new(HashMap::new()),
         oauth: AtomicBool::new(false),
@@ -407,6 +483,8 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
     let verifying = Arc::new(AtomicBool::new(false));
     let enriching = Arc::new(AtomicBool::new(false));
     let mut next_verification = Instant::now();
+    let maintaining = Arc::new(AtomicBool::new(false));
+    let mut next_maintenance = Instant::now() + Duration::from_secs(30);
     let mut last_media = u64::MAX;
     let mut last_persist = Instant::now();
     let mut pending_playback = reducer::PendingPlayback::default();
@@ -450,7 +528,8 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
             },
             event = observed.recv_async() => if let Ok(event) = event {
                 pending_playback.note(&event);
-                if matches!(event, PlayerEvent::Authentication { logged_in: false, .. }) {
+                let previous = shared.snapshot();
+                if matches!(event, PlayerEvent::Authentication { logged_in: false, .. }) && (previous.soloist_ready || previous.owned_device_verified) {
                     shared.generation.fetch_add(1, Ordering::AcqRel);
                     *shared.device.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
@@ -493,6 +572,10 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
             shared.update(|snapshot| snapshot.spectrum = None);
         }
         let snapshot = shared.snapshot();
+        if Instant::now() >= next_maintenance && !maintaining.swap(true, Ordering::AcqRel) {
+            next_maintenance = Instant::now() + Duration::from_secs(30);
+            maintain_api(shared.clone(), maintaining.clone());
+        }
         if snapshot.sequence != last_media {
             let native_ready = media.update(&snapshot);
             if snapshot.native_media_ready != native_ready {
@@ -526,7 +609,7 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
             }
         }
         if snapshot.soloist_ready
-            && !snapshot.owned_device_verified
+            && (!snapshot.owned_device_verified || !snapshot.catalog_available)
             && Instant::now() >= next_verification
             && !verifying.load(Ordering::Acquire)
         {
@@ -570,22 +653,22 @@ fn verify_device(shared: Arc<Shared>, pending: Arc<AtomicBool>, id: String) {
     pending.store(true, Ordering::Release);
     let generation = shared.generation.load(Ordering::Acquire);
     std::thread::spawn(move || {
-        let verified = {
-            let mut api = shared
-                .api
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            api.as_mut()
-                .and_then(|api| {
-                    api.request(HttpMethod::Get, "/v1/me/player/devices", None)
-                        .ok()
-                })
-                .is_some_and(|value| controller::verify_owned_device(&value, &id))
-        };
+        let response = shared.api_call(generation, HttpMethod::Get, "/v1/me/player/devices", None);
         if shared.generation.load(Ordering::Acquire) != generation {
             pending.store(false, Ordering::Release);
             return;
         }
+        let verified = match response {
+            Ok(value) => controller::verify_owned_device(&value, &id),
+            Err(error) => {
+                shared.api_failure(&error);
+                shared.update(|snapshot| {
+                    snapshot.message = Some(format!("Owned-device verification: {error}"))
+                });
+                pending.store(false, Ordering::Release);
+                return;
+            }
+        };
         if verified && shared.snapshot().soloist_ready {
             *shared
                 .device
@@ -601,14 +684,62 @@ fn verify_device(shared: Arc<Shared>, pending: Arc<AtomicBool>, id: String) {
             }
         }
         shared.update(|snapshot| { if shared.generation.load(Ordering::Acquire) != generation { return; }
-            snapshot.owned_device_verified = verified && snapshot.soloist_ready; reducer::readiness(snapshot);
-            snapshot.message = (!verified).then(|| "Owned Soloist device not found in this Web API account; reconcile authentication".into()); });
+            snapshot.catalog_available = true; snapshot.owned_device_verified = verified && snapshot.soloist_ready; reducer::readiness(snapshot);
+            if !verified { snapshot.message = Some("Owned Soloist device not found in this Web API account; reconcile authentication".into()); }
+            else if snapshot.readiness == ServiceState::Ready { snapshot.message = None; }
+            if verified && snapshot.track.is_some() && snapshot.metadata_status == MetadataStatus::Unavailable {
+                snapshot.metadata_status = MetadataStatus::Loading;
+            }
+        });
+        pending.store(false, Ordering::Release);
+    });
+}
+
+fn maintain_api(shared: Arc<Shared>, pending: Arc<AtomicBool>) {
+    let generation = shared.generation.load(Ordering::Acquire);
+    std::thread::spawn(move || {
+        let Ok(_permit) = shared.api_gate.enter(Duration::from_secs(3)) else {
+            pending.store(false, Ordering::Release);
+            return;
+        };
+        if shared.generation.load(Ordering::Acquire) != generation {
+            pending.store(false, Ordering::Release);
+            return;
+        }
+        let result = shared
+            .api
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .map(ApiClient::maintain);
+        if let Some(result) = result {
+            shared.update(|snapshot| {
+                if shared.generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let previously_failed = !snapshot.web_api_ready;
+                snapshot.web_api_ready = result.is_ok();
+                reducer::readiness(snapshot);
+                match result {
+                    Err(error) => {
+                        snapshot.catalog_available = false;
+                        reducer::readiness(snapshot);
+                        snapshot.message = Some(error.to_string());
+                    }
+                    Ok(()) if previously_failed && snapshot.readiness == ServiceState::Ready => {
+                        snapshot.message = None
+                    }
+                    _ => {}
+                }
+            });
+        }
         pending.store(false, Ordering::Release);
     });
 }
 
 fn enrich(shared: Arc<Shared>, pending: Arc<AtomicBool>, uri: String) {
     pending.store(true, Ordering::Release);
+    let generation = shared.generation.load(Ordering::Acquire);
     std::thread::spawn(move || {
         let mut parts = uri.split(':');
         let kind = parts.nth(1).unwrap_or("");
@@ -618,21 +749,30 @@ fn enrich(shared: Arc<Shared>, pending: Arc<AtomicBool>, uri: String) {
             "episode" => "episodes",
             _ => "",
         };
-        let value = if !endpoint.is_empty()
+        let result = if !endpoint.is_empty()
             && id.len() == 22
             && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
         {
-            shared
-                .api
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_mut()
-                .and_then(|api| {
-                    api.request(HttpMethod::Get, &format!("/v1/{endpoint}/{id}"), None)
-                        .ok()
-                })
+            Some(shared.api_call(
+                generation,
+                HttpMethod::Get,
+                &format!("/v1/{endpoint}/{id}"),
+                None,
+            ))
         } else {
             None
+        };
+        if shared.generation.load(Ordering::Acquire) != generation {
+            pending.store(false, Ordering::Release);
+            return;
+        }
+        let value = match result {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => {
+                shared.api_failure(&error);
+                None
+            }
+            None => None,
         };
         shared.update(|snapshot| {
             if snapshot.track.as_ref().is_none_or(|track| track.uri != uri) {
@@ -744,4 +884,57 @@ fn media_command(event: MediaControlEvent, snapshot: &Snapshot) -> Option<Player
         },
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> Arc<Shared> {
+        let mut snapshot = Snapshot::starting("/unused/test/config".into(), "Device".into());
+        snapshot.web_api_ready = true;
+        snapshot.catalog_available = true;
+        snapshot.soloist_ready = true;
+        snapshot.native_media_ready = true;
+        snapshot.owned_device_verified = true;
+        snapshot.locally_active = true;
+        snapshot.playback = PlaybackStatus::Playing;
+        snapshot.position.speed = 1.0;
+        reducer::readiness(&mut snapshot);
+        let (commands, _) = flume::bounded(1);
+        Arc::new(Shared {
+            snapshot: Mutex::new(snapshot),
+            changed: Condvar::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            api: Mutex::new(None),
+            api_gate: Arc::new(api_gate::ApiGate::default()),
+            device: Mutex::new(Some("owned".into())),
+            subscriptions: Mutex::new(HashMap::new()),
+            oauth: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            commands,
+        })
+    }
+    #[test]
+    fn transient_catalog_failure_does_not_invalidate_previously_owned_local_audio() {
+        let owner = fixture();
+        owner.api_failure(&ApiError::RateLimited {
+            retry_after_secs: Some(300),
+        });
+        let snapshot = owner.snapshot();
+        assert_eq!(snapshot.readiness, ServiceState::Degraded);
+        assert!(!snapshot.catalog_available);
+        assert!(snapshot.owned_device_verified);
+        assert_eq!(snapshot.playback, PlaybackStatus::Playing);
+        assert_eq!(snapshot.position.speed, 1.0);
+    }
+    #[test]
+    fn a_restricted_resource_is_not_global_logout_and_revocation_is_explicit() {
+        let owner = fixture();
+        owner.api_failure(&ApiError::Restricted);
+        assert_eq!(owner.snapshot().readiness, ServiceState::Ready);
+        owner.api_failure(&ApiError::Unauthorized);
+        assert!(!owner.snapshot().web_api_ready);
+        assert_eq!(owner.snapshot().readiness, ServiceState::Degraded);
+        assert!(owner.snapshot().owned_device_verified);
+    }
 }

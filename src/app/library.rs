@@ -208,6 +208,8 @@ pub(crate) struct Library {
     // difference (issue #25). Lives here because `set` is the one delivery
     // point for every section.
     loaded: std::collections::HashSet<Section>,
+    requests: std::collections::HashMap<Section, super::RequestGate>,
+    errors: std::collections::HashMap<Section, crate::api::ApiError>,
 }
 
 impl Library {
@@ -232,6 +234,7 @@ impl Library {
         }
     }
     pub(crate) fn set(&mut self, s: Section, items: Vec<LibItem>) {
+        self.errors.remove(&s);
         self.loaded.insert(s);
         match s {
             Section::Home => self.home = items,
@@ -248,18 +251,53 @@ impl Library {
         self.loaded.contains(&s)
     }
 
-    /// A refresh is starting: sections are loading again. Existing items keep
-    /// rendering; only *empty* sections fall back to the loading label.
-    pub(crate) fn reset_loading(&mut self) {
+    /// Invalidate membership after a confirmed or uncertain mutation. Preserve
+    /// old visible data until a complete, successful replacement arrives.
+    pub(crate) fn invalidate(&mut self) {
         self.loaded.clear();
+        self.errors.clear();
+        for gate in self.requests.values_mut() {
+            gate.cancel();
+        }
     }
-
-    /// The fetch gave up (retries exhausted). Mark everything delivered so
-    /// empty sections read "(empty)" honestly — the status line carries the
-    /// failure message.
-    #[cfg(test)]
-    pub(crate) fn mark_all_loaded(&mut self) {
-        self.loaded.extend(Section::ALL);
+    /// Unlike an ordinary refresh, an authority change must not retain rows
+    /// from the old account, including sections that are currently hidden.
+    pub(crate) fn clear_authority(&mut self) {
+        self.invalidate();
+        for section in Section::ALL {
+            self.items_mut(section).clear();
+        }
+    }
+    pub(crate) fn error(&self, section: Section) -> Option<&crate::api::ApiError> {
+        self.errors.get(&section)
+    }
+    pub(crate) fn request(&mut self, section: Section, force: bool) -> Option<u64> {
+        let gate = self.requests.entry(section).or_default();
+        if !force
+            && (gate.pending()
+                || self.loaded.contains(&section)
+                || self.errors.contains_key(&section))
+        {
+            return None;
+        }
+        self.errors.remove(&section);
+        Some(gate.start())
+    }
+    pub(crate) fn receive(
+        &mut self,
+        section: Section,
+        reply: crate::api::Reply<Vec<LibItem>>,
+    ) -> bool {
+        if !self.requests.entry(section).or_default().finish(reply.id) {
+            return false;
+        }
+        match reply.result {
+            Ok(items) => self.set(section, items),
+            Err(error) => {
+                self.errors.insert(section, error);
+            }
+        }
+        true
     }
 }
 
@@ -277,14 +315,19 @@ mod loaded_tracking_tests {
     }
 
     #[test]
-    fn refresh_resets_and_failure_marks_all() {
+    fn failed_refresh_preserves_valid_rows_and_does_not_retry_each_frame() {
         let mut lib = Library::default();
-        lib.set(Section::Home, Vec::new());
-        lib.reset_loading();
-        assert!(!lib.is_loaded(Section::Home));
-        lib.mark_all_loaded();
-        for s in Section::ALL {
-            assert!(lib.is_loaded(s));
-        }
+        lib.set(Section::Home, vec![LibItem::header("valid rows")]);
+        let id = lib.request(Section::Home, true).unwrap();
+        lib.receive(
+            Section::Home,
+            crate::api::Reply {
+                id,
+                result: Err(crate::api::ApiError::Restricted),
+            },
+        );
+        assert_eq!(lib.items(Section::Home)[0].name, "valid rows");
+        assert!(lib.error(Section::Home).is_some());
+        assert!(lib.request(Section::Home, false).is_none());
     }
 }

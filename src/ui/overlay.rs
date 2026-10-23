@@ -26,7 +26,11 @@ pub(crate) fn render_actions_overlay(f: &mut Frame, app: &App, theme: Theme, are
     let max = inner.width as usize;
     let mut lines = vec![
         Line::from(Span::styled(truncate(&menu.title, max), theme.heading())),
-        Line::raw(""),
+        app.session
+            .menu_error
+            .as_ref()
+            .map(|error| Line::from(Span::styled(error.to_string(), theme.muted())))
+            .unwrap_or_else(|| Line::raw("")),
     ];
     for (i, it) in menu
         .items

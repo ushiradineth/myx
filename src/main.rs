@@ -108,12 +108,12 @@ fn main() -> Result<()> {
         "MYX_BACKEND is a removed option; unset it and use --help for supported commands"
     );
     myx::config::init_path(cli.config.as_deref())?;
-    myx::config::get().validate()?;
     install_logger();
     let _ = rustls::crypto::ring::default_provider().install_default();
     if myx::client::handle_management(&cli)? {
         return Ok(());
     }
+    myx::config::get().validate()?;
     let prepare = || -> Result<Startup> {
         let connection =
             Connection::ensure(&Config::path().context("resolve configuration path")?)?;
@@ -209,9 +209,9 @@ async fn boot(terminal: &mut Term, startup: Startup, picker: Picker) -> Result<(
             equalizer: None,
         },
         session: SessionState {
+            authority: Some(CatalogAuthority::from_snapshot(&snapshot)),
             pending_meta: snapshot.track.as_ref().map(|track| track.uri.clone()),
-            last_ctrl_c: None,
-            last_click: None,
+            ..Default::default()
         },
         art_repaint: ArtRepaint::Idle,
     };
@@ -257,14 +257,24 @@ async fn run_headless(startup: Startup, duration: Duration) -> Result<()> {
 }
 
 struct UiChannels {
-    meta: flume::Sender<TrackMeta>,
-    lib: flume::Sender<(Section, Vec<LibItem>)>,
-    search: flume::Sender<Vec<LibItem>>,
-    lyrics: flume::Sender<(Vec<(u32, String)>, bool)>,
-    detail: flume::Sender<(String, String, Vec<LibItem>)>,
-    menu: flume::Sender<ActionMenu>,
-    astatus: flume::Sender<String>,
-    libdone: flume::Sender<bool>,
+    meta: flume::Sender<Reply<TrackMeta>>,
+    lib: flume::Sender<LibraryReply>,
+    search: flume::Sender<Reply<SearchResults>>,
+    lyrics: flume::Sender<Reply<LyricsResult>>,
+    detail: flume::Sender<Reply<DetailResult>>,
+    menu: flume::Sender<Reply<ActionMenu>>,
+    astatus: flume::Sender<Reply<ActionOutcome>>,
+}
+
+fn request_library_section(app: &mut App, chans: &UiChannels, force: bool) {
+    if app.search.searching || !app.browse.details.is_empty() {
+        return;
+    }
+    let section = app.browse.section;
+    if let Some(id) = app.browse.library.request(section, force) {
+        app.status = format!("loading {}…", section.label());
+        spawn_library_fetch(app.svc.webapi.clone(), section, id, chans.lib.clone());
+    }
 }
 
 async fn run_ui(
@@ -296,14 +306,13 @@ async fn run_ui(
             }
         }
     });
-    let (meta_tx, meta_rx) = flume::unbounded::<TrackMeta>();
-    let (lib_tx, lib_rx) = flume::unbounded::<(Section, Vec<LibItem>)>();
-    let (search_tx, search_rx) = flume::unbounded::<Vec<LibItem>>();
-    let (lyrics_tx, lyrics_rx) = flume::unbounded::<(Vec<(u32, String)>, bool)>();
-    let (detail_tx, detail_rx) = flume::unbounded::<(String, String, Vec<LibItem>)>();
-    let (menu_tx, menu_rx) = flume::unbounded::<ActionMenu>();
-    let (astatus_tx, astatus_rx) = flume::unbounded::<String>();
-    let (libdone_tx, libdone_rx) = flume::unbounded::<bool>();
+    let (meta_tx, meta_rx) = flume::unbounded::<Reply<TrackMeta>>();
+    let (lib_tx, lib_rx) = flume::unbounded::<LibraryReply>();
+    let (search_tx, search_rx) = flume::unbounded::<Reply<SearchResults>>();
+    let (lyrics_tx, lyrics_rx) = flume::unbounded::<Reply<LyricsResult>>();
+    let (detail_tx, detail_rx) = flume::unbounded::<Reply<DetailResult>>();
+    let (menu_tx, menu_rx) = flume::unbounded::<Reply<ActionMenu>>();
+    let (astatus_tx, astatus_rx) = flume::unbounded::<Reply<ActionOutcome>>();
     let chans = UiChannels {
         meta: meta_tx,
         lib: lib_tx,
@@ -312,18 +321,14 @@ async fn run_ui(
         detail: detail_tx,
         menu: menu_tx,
         astatus: astatus_tx,
-        libdone: libdone_tx,
     };
-    spawn_library_fetch(
-        app.svc.webapi.clone(),
-        chans.lib.clone(),
-        chans.libdone.clone(),
-    );
+    request_library_section(&mut app, &chans, false);
     if let Some(track) = initial_track {
         let tx = chans.meta.clone();
         let webapi = app.svc.webapi.clone();
+        let id = app.session.artwork_request.start();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send(fetch_sdk_artwork(
+            let meta = fetch_sdk_artwork(
                 &webapi,
                 TrackMetadata {
                     uri: track.uri,
@@ -336,11 +341,14 @@ async fn run_ui(
                     duration_ms: track.duration_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
                     cover_url: track.artwork_url,
                 },
-            ));
+            );
+            let _ = tx.send(Reply {
+                id,
+                result: Ok(meta),
+            });
         });
     }
     let in_tmux = std::env::var_os("TMUX").is_some();
-    let mut lib_attempts = 0;
     let mut frame = tokio::time::interval(Duration::from_millis(16));
     frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_draw = Instant::now() - IDLE_REDRAW;
@@ -356,6 +364,8 @@ async fn run_ui(
             biased;
             signal = shutdown.recv() => { signal?; break; },
             _ = frame.tick() => {
+                request_library_section(&mut app, &chans, false);
+                if app.view.mode == RightView::Lyrics { request_lyrics(&mut app, &chans.lyrics); }
                 app.playback.flush_seek(&app.svc.engine, Instant::now());
                 let spectrum_visible = app.view.mode == RightView::NowPlaying
                     && app.view.actions.is_none() && app.view.equalizer.is_none()
@@ -364,23 +374,20 @@ async fn run_ui(
                     app.svc.engine.set_spectrum_enabled(spectrum_visible);
                     spectrum_enabled = spectrum_visible;
                 }
-                while let Ok((section, mut items)) = lib_rx.try_recv() {
+                while let Ok(LibraryReply { section, reply }) = lib_rx.try_recv() {
+                    let delivered = reply.result.is_ok();
+                    if !app.browse.library.receive(section, reply) { continue; }
                     dirty = true;
-                    for (i, item) in items.iter_mut().enumerate() { item.order = i as u32; }
-                    app.browse.library.set(section, items);
-                    sort_list(app.browse.library.items_mut(section), app.browse.sort);
-                    if section == app.browse.section { app.normalize_selection(); }
-                    app.status = format!("loaded {}", section.label());
-                }
-                while let Ok(got_any) = libdone_rx.try_recv() {
-                    dirty = true;
-                    if got_any { lib_attempts = 0; app.status.clear(); }
-                    else if lib_attempts < 2 {
-                        lib_attempts += 1;
-                        app.status = "retrying library…".into();
-                        spawn_library_fetch(app.svc.webapi.clone(), chans.lib.clone(), chans.libdone.clone());
-                    } else {
-                        app.status = "library failed — press r to reload".into();
+                    if delivered {
+                        let items = app.browse.library.items_mut(section);
+                        for (i, item) in items.iter_mut().enumerate() { item.order = i as u32; }
+                        sort_list(app.browse.library.items_mut(section), app.browse.sort);
+                    }
+                    if section == app.browse.section && !app.search.searching && app.browse.details.is_empty() {
+                        app.normalize_selection();
+                        app.status = app.browse.library.error(section)
+                            .map(|error| format!("{}: {error}; press r to reload", section.label()))
+                            .unwrap_or_else(|| format!("loaded {}", section.label()));
                     }
                 }
                 let animating = app.theme.fade.is_some()
@@ -449,32 +456,120 @@ async fn run_ui(
                 }
                 true
             }
-            m = meta_rx.recv_async() => { if let Ok(meta) = m { apply_meta(&mut app, meta, &chans.lyrics); } true }
-            s = search_rx.recv_async() => {
-                if let Ok(results) = s {
-                    app.search.in_flight = false; app.search.search_results = results;
-                    app.browse.selected = app.first_selectable();
-                    app.status = if app.search.search_results.is_empty() { "no results".into() } else { String::new() };
-                }
-                true
-            }
-            ly = lyrics_rx.recv_async() => { if let Ok((lines, synced)) = ly { app.view.lyrics = lines; app.view.lyrics_synced = synced; } true }
-            d = detail_rx.recv_async() => {
-                if let Ok((context_uri, title, items)) = d {
-                    app.browse.details.push(Detail { context_uri, title, items, parent_selected: app.browse.selected });
-                    app.browse.selected = app.first_selectable(); app.status.clear();
-                }
-                true
-            }
-            menu = menu_rx.recv_async() => {
-                if let Ok(mut menu) = menu {
-                    if let Some(open) = app.view.actions.as_ref().filter(|_| !menu.items.is_empty()) {
-                        menu.selected = open.selected.min(menu.items.len() - 1); app.view.actions = Some(menu);
+            m = meta_rx.recv_async() => {
+                if let Ok(reply) = m {
+                    if app.session.artwork_request.finish(reply.id) {
+                        if let Ok(meta) = reply.result { apply_meta(&mut app, meta); }
                     }
                 }
                 true
             }
-            st = astatus_rx.recv_async() => { if let Ok(msg) = st { app.status = msg; } true }
+            s = search_rx.recv_async() => {
+                if let Ok(reply) = s {
+                    if app.session.search_request.finish(reply.id) && app.search.searching {
+                        app.search.in_flight = false;
+                        match reply.result {
+                            Ok(results) => {
+                                app.session.search_error = None;
+                                app.session.search_notice = results.notice.clone();
+                                app.search.search_results = results.rows;
+                                app.browse.selected = app.first_selectable();
+                                app.status = results.notice.unwrap_or_else(|| if app.search.search_results.is_empty() { "no results".into() } else { String::new() });
+                            }
+                            Err(error) => { app.status = format!("search: {error}; previous results retained"); app.session.search_error = Some(error); }
+                        }
+                    }
+                }
+                true
+            }
+            ly = lyrics_rx.recv_async() => {
+                if let Ok(reply) = ly {
+                    if app.session.lyrics_request.finish(reply.id) {
+                        match reply.result {
+                            Ok(result) if meta_is_current(app.session.pending_meta.as_deref(), &result.uri) => {
+                                app.view.lyrics = result.lines; app.view.lyrics_synced = result.synced;
+                                app.session.lyrics_error = None;
+                            }
+                            Err(error) => app.session.lyrics_error = Some(error),
+                            _ => {},
+                        }
+                    }
+                }
+                true
+            }
+            d = detail_rx.recv_async() => {
+                if let Ok(reply) = d {
+                    if app.session.detail_request.finish(reply.id) {
+                        match reply.result {
+                            Ok(detail) => {
+                                if let Some(open) = app.browse.details.last_mut().filter(|open| open.context_uri == detail.uri) {
+                                    open.items = detail.items; open.title = detail.title;
+                                } else {
+                                    app.browse.details.push(Detail { context_uri: detail.uri, title: detail.title, items: detail.items, parent_selected: app.browse.selected });
+                                }
+                                app.browse.selected = app.first_selectable(); app.status = detail.notice.unwrap_or_default();
+                            }
+                            Err(error) => app.status = format!("detail: {error}; previous view retained"),
+                        }
+                    }
+                }
+                true
+            }
+            menu = menu_rx.recv_async() => {
+                if let Ok(reply) = menu {
+                    if app.session.menu_request.finish(reply.id) && app.view.actions.is_some() {
+                        match reply.result {
+                            Ok(mut menu) => {
+                                let open = app.view.actions.as_ref().expect("open menu");
+                                menu.selected = open.items.get(open.selected)
+                                    .and_then(|selected| menu.items.iter().position(|item| item.kind == selected.kind)).unwrap_or(0);
+                                app.session.menu_error = None;
+                                if menu.items.is_empty() { app.status = "no playlists available".into(); }
+                                app.view.actions = Some(menu);
+                            }
+                            Err(error) => {
+                                app.status = format!("menu: {error}; membership unknown");
+                                app.session.menu_error = Some(error);
+                                if let Some(open) = app.view.actions.as_mut().filter(|open| open.items.is_empty()) { open.title = "Playlist list unavailable".into(); }
+                            }
+                        }
+                    }
+                }
+                true
+            }
+            st = astatus_rx.recv_async() => {
+                if let Ok(reply) = st {
+                    if app.session.action_request.finish(reply.id) {
+                        let refresh = reply.result.as_ref().map(|outcome| outcome.refresh_library).unwrap_or_else(|error| *error == ApiError::AmbiguousWrite);
+                        if refresh {
+                            app.browse.library.invalidate();
+                            request_library_section(&mut app, &chans, false);
+                            if let Some(item) = app.session.menu_item.clone().filter(|_| app.view.actions.is_some()) {
+                                // A menu opened while the write was in flight may
+                                // contain pre-write membership. Remove stale toggles
+                                // until a new contains read settles that menu.
+                                app.view.actions = build_action_menu(None, &item).ok();
+                                app.session.menu_error = None;
+                                let id = app.session.menu_request.start();
+                                spawn_action_menu(app.svc.webapi.clone(), item, id, chans.menu.clone());
+                            }
+                            if let Some(detail) = app.browse.details.last() {
+                                let (uri, name) = (detail.context_uri.clone(), detail.title.clone());
+                                let id = app.session.detail_request.start();
+                                spawn_detail_fetch(app.svc.webapi.clone(), uri, name, id, chans.detail.clone());
+                            }
+                        }
+                        app.status = match reply.result {
+                            Ok(outcome) => outcome.message.into(),
+                            Err(error) => {
+                                if error == ApiError::AmbiguousWrite { app.session.mutation_uncertain = true; }
+                                format!("library action: {error}; refresh before trying again")
+                            }
+                        };
+                    }
+                }
+                true
+            }
         };
         dirty |= touched;
     }

@@ -35,15 +35,19 @@ fn largest_cover_url(images: &serde_json::Value) -> Option<&str> {
 /// Viewer artwork enrichment only. Observed text stays intact, catalog requests
 /// use the daemon, and image downloads/decoding run on the blocking worker.
 pub(crate) fn fetch_sdk_artwork(webapi: &Arc<Mutex<WebApi>>, meta: TrackMetadata) -> TrackMeta {
-    let client = http_client();
-    // There is no episode metadata fetch in the existing API layer. Episodes
-    // (and other SDK URI kinds) keep their SDK cover instead of guessing an API.
-    let preferred = track_id_from_uri(&meta.uri)
-        .and_then(|id| {
-            let token = connection_of(webapi)?;
-            get_json_cached(&client, &format!("{API}/tracks/{id}"), &token)
-        })
-        .and_then(|v| largest_cover_url(&v["album"]["images"]).map(String::from));
+    // Resolve image candidates only; never replace canonical text with another
+    // request's metadata. A catalog or image failure still delivers that text.
+    let preferred = connection_of(webapi).ok().and_then(|connection| {
+        if let Some(id) = track_id_from_uri(&meta.uri) {
+            let value = get_json(&connection, &format!("{API}/tracks/{id}")).ok()?;
+            largest_cover_url(&value["album"]["images"]).map(String::from)
+        } else if let Some(id) = meta.uri.strip_prefix("spotify:episode:") {
+            let value = get_json(&connection, &format!("{API}/episodes/{id}")).ok()?;
+            largest_cover_url(&value["images"]).map(String::from)
+        } else {
+            None
+        }
+    });
     let fallback = TrackMeta {
         uri: meta.uri.clone(),
         title: meta.title.clone(),
@@ -58,6 +62,9 @@ pub(crate) fn fetch_sdk_artwork(webapi: &Arc<Mutex<WebApi>>, meta: TrackMetadata
     };
     // Text/lyrics/native metadata must still be delivered when all image HTTP
     // fails. The receiver preserves a same-track cover on an image-less update.
+    let Ok(client) = http_client() else {
+        return fallback;
+    };
     sdk_artwork_meta(meta, preferred.as_deref(), |url| fetch_cover(&client, url))
         .unwrap_or(fallback)
 }
@@ -75,7 +82,7 @@ fn sdk_artwork_meta(
         .filter(|url| Some(*url) != preferred);
     let (url, image) = preferred.into_iter().chain(fallback).find_map(|url| {
         let bytes = fetch(url)?;
-        let image = image::load_from_memory(&bytes).ok()?;
+        let image = decode_cover(&bytes)?;
         Some((url.to_owned(), image))
     })?;
     let theme = Some(derive_theme(&image, "album ✦"));
@@ -91,6 +98,21 @@ fn sdk_artwork_meta(
         },
         theme,
     })
+}
+
+fn decode_cover(bytes: &[u8]) -> Option<image::DynamicImage> {
+    if bytes.len() > 12 * 1024 * 1024 {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().ok()
 }
 
 #[cfg(test)]
@@ -115,6 +137,34 @@ mod artwork_tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    #[test]
+    fn oversized_decoded_image_uses_the_fallback_without_losing_canonical_text() {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4097, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let oversized = encoded.into_inner();
+        let mut requested = Vec::new();
+        let result = sdk_artwork_meta(sdk_meta(), Some("https://api.example/oversized"), |url| {
+            requested.push(url.to_owned());
+            Some(if url.ends_with("oversized") {
+                oversized.clone()
+            } else {
+                png()
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            requested,
+            ["https://api.example/oversized", "https://sdk.example/cover"]
+        );
+        assert_eq!(result.title, "SDK title");
+        assert_eq!(
+            result.image.url.as_deref(),
+            Some("https://sdk.example/cover")
+        );
     }
 
     #[test]

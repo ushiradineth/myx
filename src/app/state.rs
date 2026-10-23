@@ -170,7 +170,9 @@ pub(crate) struct EqualizerOverlay {
 
 /// Cross-cutting session bookkeeping: which metadata fetch is still in flight
 /// and the input timestamps that make Ctrl-C and double-click work.
+#[derive(Default)]
 pub(crate) struct SessionState {
+    pub(crate) authority: Option<CatalogAuthority>,
     // Track URI whose metadata was last requested. Fetches run on separate
     // blocking tasks and can land out of order when skipping quickly, so a
     // reply for any other track is stale and must be dropped.
@@ -178,4 +180,120 @@ pub(crate) struct SessionState {
     // Timestamp of last Ctrl-C — a second press within 1.5s quits.
     pub(crate) last_ctrl_c: Option<Instant>,
     pub(crate) last_click: Option<(u16, Instant)>,
+    pub(crate) search_request: RequestGate,
+    pub(crate) detail_request: RequestGate,
+    pub(crate) menu_request: RequestGate,
+    pub(crate) action_request: RequestGate,
+    pub(crate) artwork_request: RequestGate,
+    pub(crate) lyrics_request: RequestGate,
+    pub(crate) lyrics_key: Option<(String, String, String, String, u32)>,
+    pub(crate) search_error: Option<ApiError>,
+    pub(crate) lyrics_error: Option<ApiError>,
+    pub(crate) menu_error: Option<ApiError>,
+    pub(crate) search_notice: Option<String>,
+    pub(crate) mutation_uncertain: bool,
+    pub(crate) menu_item: Option<LibItem>,
+}
+
+/// Opaque daemon authority, never an account identifier or an OAuth credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogAuthority {
+    pub(crate) session_id: String,
+    pub(crate) auth_revision: u64,
+}
+
+impl CatalogAuthority {
+    pub(crate) fn from_snapshot(snapshot: &Snapshot) -> Self {
+        Self {
+            session_id: snapshot.session_id.clone(),
+            auth_revision: snapshot.auth_revision,
+        }
+    }
+}
+
+impl SessionState {
+    /// Account-derived navigation is closed on replacement, so only the selected
+    /// section is demand-loaded again. Keep the gates themselves: resetting their
+    /// counters would let an old id collide with the first new-account request.
+    pub(crate) fn observe_authority(
+        &mut self,
+        snapshot: &Snapshot,
+        browse: &mut BrowseState,
+        search: &mut SearchState,
+        view: &mut ViewState,
+    ) -> bool {
+        let authority = CatalogAuthority::from_snapshot(snapshot);
+        if self.authority.as_ref() == Some(&authority) {
+            return false;
+        }
+        self.authority = Some(authority);
+        for gate in [
+            &mut self.search_request,
+            &mut self.detail_request,
+            &mut self.menu_request,
+            &mut self.action_request,
+            &mut self.artwork_request,
+            &mut self.lyrics_request,
+        ] {
+            gate.cancel();
+        }
+        self.pending_meta = Some(
+            snapshot
+                .track
+                .as_ref()
+                .map(|track| track.uri.clone())
+                .unwrap_or_default(),
+        );
+        self.lyrics_key = None;
+        self.search_error = None;
+        self.lyrics_error = None;
+        self.menu_error = None;
+        self.search_notice = None;
+        self.mutation_uncertain = false;
+        self.menu_item = None;
+        self.last_click = None;
+        browse.library.clear_authority();
+        browse.details.clear();
+        browse.selected = 0;
+        search.search_results.clear();
+        search.searching = false;
+        search.input_mode = false;
+        search.in_flight = false;
+        view.actions = None;
+        view.lyrics.clear();
+        view.lyrics_synced = false;
+        true
+    }
+}
+
+/// A generation is separate from a URI/query: opening the same target again
+/// must still reject work from an earlier visit, including its errors.
+#[derive(Default, Clone)]
+pub(crate) struct RequestGate {
+    generation: u64,
+    active: Option<u64>,
+}
+
+impl RequestGate {
+    pub(crate) fn start(&mut self) -> u64 {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("request generation exhausted");
+        self.active = Some(self.generation);
+        self.generation
+    }
+    pub(crate) fn cancel(&mut self) {
+        self.active = None;
+    }
+    pub(crate) fn pending(&self) -> bool {
+        self.active.is_some()
+    }
+    pub(crate) fn finish(&mut self, id: u64) -> bool {
+        if self.active != Some(id) {
+            return false;
+        }
+        self.active = None;
+        true
+    }
 }

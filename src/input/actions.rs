@@ -4,14 +4,11 @@
 use crate::*;
 
 /// Handle input while the actions menu is open.
-pub(crate) fn handle_action_key(
-    app: &mut App,
-    code: KeyCode,
-    detail_tx: &flume::Sender<(String, String, Vec<LibItem>)>,
-    astatus_tx: &flume::Sender<String>,
-) {
+pub(crate) fn handle_action_key(app: &mut App, code: KeyCode, chans: &UiChannels) {
     match code {
         KeyCode::Esc | KeyCode::Char('a') => {
+            app.session.menu_request.cancel();
+            app.session.menu_item = None;
             app.view.actions = None;
             app.status.clear();
             return;
@@ -42,32 +39,15 @@ pub(crate) fn handle_action_key(
     let Some(kind) = kind else { return };
     match kind {
         ActionKind::AddToPlaylistMenu { track_uri } => {
-            let items: Vec<ActionItem> = app
-                .browse
-                .library
-                .playlists
-                .iter()
-                .filter_map(|p| {
-                    let id = p.uri.rsplit(':').next()?.to_string();
-                    Some(ActionItem {
-                        label: p.name.clone(),
-                        kind: ActionKind::AddToPlaylist {
-                            playlist_id: id,
-                            track_uri: track_uri.clone(),
-                        },
-                    })
-                })
-                .collect();
-            if items.is_empty() {
-                app.status = "no playlists to add to".to_string();
-                app.view.actions = None;
-            } else {
-                app.view.actions = Some(ActionMenu {
-                    title: "Add to playlist".to_string(),
-                    items,
-                    selected: 0,
-                });
-            }
+            app.session.menu_item = None;
+            app.session.menu_error = None;
+            let id = app.session.menu_request.start();
+            app.view.actions = Some(ActionMenu {
+                title: "Loading playlists…".into(),
+                items: Vec::new(),
+                selected: 0,
+            });
+            spawn_playlist_menu(app.svc.webapi.clone(), track_uri, id, chans.menu.clone());
         }
         ActionKind::Play { uri, name } => {
             // Previously called engine.play_context directly, leaving
@@ -78,7 +58,10 @@ pub(crate) fn handle_action_key(
             app.view.actions = None;
         }
         ActionKind::Open { uri, name } => {
-            spawn_detail_fetch(app.svc.webapi.clone(), uri, name, detail_tx.clone());
+            app.session.search_request.cancel();
+            app.search.in_flight = false;
+            let id = app.session.detail_request.start();
+            spawn_detail_fetch(app.svc.webapi.clone(), uri, name, id, chans.detail.clone());
             app.view.actions = None;
         }
         ActionKind::CopyLink { uri } => {
@@ -90,14 +73,24 @@ pub(crate) fn handle_action_key(
             app.view.actions = None;
         }
         other => {
+            if app.session.action_request.pending() {
+                app.status = "library write awaiting confirmation".into();
+                return;
+            }
+            let id = app.session.action_request.start();
             spawn_action(
                 &app.svc.engine,
                 app.svc.webapi.clone(),
                 other,
-                astatus_tx.clone(),
+                id,
+                chans.astatus.clone(),
             );
             app.view.actions = None;
         }
+    }
+    if app.view.actions.is_none() {
+        app.session.menu_request.cancel();
+        app.session.menu_item = None;
     }
 }
 

@@ -5,7 +5,7 @@ use crate::*;
 pub(crate) fn handle_engine_event(
     app: &mut App,
     ev: EngineEvent,
-    meta_tx: &flume::Sender<TrackMeta>,
+    meta_tx: &flume::Sender<Reply<TrackMeta>>,
 ) {
     // Position ticks would bury everything else in the log.
     if !matches!(ev, EngineEvent::PositionCorrection { .. }) {
@@ -13,14 +13,60 @@ pub(crate) fn handle_engine_event(
     }
     match ev {
         EngineEvent::ReadModel(snapshot) => {
+            let authority_changed = app.session.observe_authority(
+                &snapshot,
+                &mut app.browse,
+                &mut app.search,
+                &mut app.view,
+            );
+            // A coalesced scrub belongs to the previous owner/account too;
+            // never flush that pending command into the replacement authority.
+            if authority_changed {
+                app.playback.seek_target = None;
+            }
             app.transport = Transport::from_snapshot(&snapshot);
             app.playback
                 .apply_snapshot(&snapshot, myx::domain::playback::now_ms());
+            if authority_changed {
+                // Canonical playback remains the daemon's; only viewer work and
+                // account-derived catalog rows are discarded. The frame loop
+                // demand-loads the selected section, not every user collection.
+                app.status = "daemon authority changed; reloading current section…".into();
+                app.art_repaint = ArtRepaint::Wipe;
+                if let Some(now) = app.playback.now.as_mut() {
+                    now.cover = None;
+                }
+                if let Some(track) = snapshot.track.as_ref() {
+                    request_artwork(
+                        app,
+                        TrackMetadata {
+                            uri: track.uri.clone(),
+                            title: track.title.clone().unwrap_or_default(),
+                            artist: track
+                                .artists
+                                .as_ref()
+                                .map(|artists| artists.join(", "))
+                                .unwrap_or_default(),
+                            album: track.album.clone().unwrap_or_default(),
+                            duration_ms: track.duration_ms.unwrap_or(0).min(u64::from(u32::MAX))
+                                as u32,
+                            cover_url: track.artwork_url.clone(),
+                        },
+                        meta_tx,
+                    );
+                }
+            }
             if let Some(message) = snapshot.message {
                 app.status = message;
             }
         }
         EngineEvent::TrackChanged { uri } => {
+            app.session.artwork_request.cancel();
+            app.session.lyrics_request.cancel();
+            app.session.lyrics_key = None;
+            app.session.lyrics_error = None;
+            app.view.lyrics.clear();
+            app.view.lyrics_synced = false;
             app.status = "loading track…".to_string();
             // The daemon resolves metadata. Keep the stale-artwork guard local.
             app.session.pending_meta = Some(uri);
@@ -30,16 +76,29 @@ pub(crate) fn handle_engine_event(
                 return;
             }
             app.session.pending_meta = Some(meta.uri.clone());
+            let lyrics_key = (
+                meta.uri.clone(),
+                meta.title.clone(),
+                meta.artist.clone(),
+                meta.album.clone(),
+                meta.duration_ms,
+            );
+            if app
+                .session
+                .lyrics_key
+                .as_ref()
+                .is_some_and(|key| key != &lyrics_key)
+            {
+                app.session.lyrics_request.cancel();
+                app.session.lyrics_key = None;
+                app.session.lyrics_error = None;
+                app.view.lyrics.clear();
+                app.view.lyrics_synced = false;
+            }
             // Establish the model synchronously, before the following Playing
             // event. Cover HTTP must not lose the first playhead/paused update.
             app.playback.apply_sdk_metadata(&meta);
-            let tx = meta_tx.clone();
-            let webapi = app.svc.webapi.clone();
-            // Keep image HTTP, decoding and palette extraction off the UI loop.
-            // Reuse apply_meta so SDK tracks retain cover, lyrics and theme updates.
-            tokio::task::spawn_blocking(move || {
-                let _ = tx.send(fetch_sdk_artwork(&webapi, meta));
-            });
+            request_artwork(app, meta, meta_tx);
         }
         EngineEvent::QueueChanged { entries } => {
             // An empty SDK queue is authoritative too, not a failed API fetch.
@@ -81,6 +140,10 @@ pub(crate) fn handle_engine_event(
             app.playback.set_local_position(position_ms, true);
         }
         EngineEvent::Stopped => {
+            app.session.artwork_request.cancel();
+            app.session.lyrics_request.cancel();
+            app.session.lyrics_key = None;
+            app.view.lyrics.clear();
             // Discard cover work still in flight for the stopped track.
             app.session.pending_meta = Some(String::new());
             app.playback.now = None;
@@ -112,6 +175,20 @@ pub(crate) fn handle_engine_event(
         }
         EngineEvent::EndOfTrack { .. } => {}
     }
+}
+
+fn request_artwork(app: &mut App, meta: TrackMetadata, tx: &flume::Sender<Reply<TrackMeta>>) {
+    let tx = tx.clone();
+    let webapi = app.svc.webapi.clone();
+    let id = app.session.artwork_request.start();
+    // Public image downloads/decoding stay outside the UI loop; an authority
+    // replacement invalidates this generation even when the track URI is equal.
+    tokio::task::spawn_blocking(move || {
+        let _ = tx.send(Reply {
+            id,
+            result: Ok(fetch_sdk_artwork(&webapi, meta)),
+        });
+    });
 }
 
 fn queue_display<'a>(
@@ -155,11 +232,7 @@ pub(crate) fn meta_is_current(pending: Option<&str>, meta_uri: &str) -> bool {
     pending.is_none_or(|p| p == meta_uri)
 }
 
-pub(crate) fn apply_meta(
-    app: &mut App,
-    meta: TrackMeta,
-    lyrics_tx: &flume::Sender<(Vec<(u32, String)>, bool)>,
-) {
+pub(crate) fn apply_meta(app: &mut App, meta: TrackMeta) {
     // Metadata fetches run on independent blocking tasks, so skipping quickly
     // (n/b) can land an earlier track's reply after a later one. Applying it
     // would replace the whole NowPlaying — title, artist and cover — with the
@@ -187,23 +260,6 @@ pub(crate) fn apply_meta(
     // A different cover encodes to a different symbol, so the diff emits it on
     // its own — no wipe, which would flash a blank box between the two covers.
     app.art_repaint = ArtRepaint::Draw;
-    app.status.clear();
-    app.view.lyrics.clear();
-    app.view.lyrics_synced = false;
-
-    // Fetch synced lyrics from lrclib for the new track.
-    if !meta.title.is_empty() {
-        let (artist, title, album, dur) = (
-            meta.artist.clone(),
-            meta.title.clone(),
-            meta.album.clone(),
-            meta.duration_ms,
-        );
-        let tx = lyrics_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = tx.send(fetch_lyrics_blocking(&artist, &title, &album, dur));
-        });
-    }
 
     app.playback.now = Some(NowPlaying {
         uri: meta.uri,

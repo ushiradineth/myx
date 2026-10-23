@@ -394,6 +394,15 @@ pub fn handle_management(cli: &Cli) -> Result<bool> {
         crate::daemon::run()?;
         return Ok(true);
     }
+    // Inspection/stop/uninstall must remain available when a user is fixing
+    // invalid config. Validate replacements before stopping an existing owner.
+    if matches!(
+        cli.mode,
+        Mode::Daemon(DaemonCommand::Start | DaemonCommand::Restart)
+            | Mode::Service(ServiceCommand::Install)
+    ) {
+        crate::config::get().validate()?;
+    }
     let config = crate::config::Config::path().context("Resolve selected configuration path")?;
     match cli.mode {
         Mode::Daemon(DaemonCommand::Start) => {

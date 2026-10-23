@@ -27,7 +27,7 @@ pub(crate) fn handle_key(
     }
 
     if app.view.actions.is_some() {
-        handle_action_key(app, code, &chans.detail, &chans.astatus);
+        handle_action_key(app, code, chans);
         return false;
     }
 
@@ -44,11 +44,15 @@ pub(crate) fn handle_key(
                 app.search.input_mode = false;
                 let q = app.search.query().trim().to_string();
                 if !q.is_empty() {
+                    app.browse.details.clear();
                     app.search.searching = true;
                     app.search.in_flight = true;
                     app.browse.selected = 0;
                     app.status = "searching…".to_string();
-                    spawn_search(app.svc.webapi.clone(), q, chans.search.clone());
+                    app.session.detail_request.cancel();
+                    let id = app.session.search_request.start();
+                    app.session.search_error = None;
+                    spawn_search(app.svc.webapi.clone(), q, id, chans.search.clone());
                 }
             }
             // Ctrl-U clears the query — readline muscle memory. The fork
@@ -79,11 +83,17 @@ pub(crate) fn handle_key(
             app.view.equalizer = Some(EqualizerOverlay::default());
         }
         KeyCode::Char('/') => {
+            app.session.search_request.cancel();
+            app.session.detail_request.cancel();
+            app.search.in_flight = false;
             app.search.input_mode = true;
             app.search.clear();
         }
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
+            app.session.detail_request.cancel();
+            app.session.search_request.cancel();
+            app.search.in_flight = false;
             if let Some(d) = app.browse.details.pop() {
                 app.browse.selected = d.parent_selected;
             } else if app.search.searching {
@@ -137,18 +147,19 @@ pub(crate) fn handle_key(
             let _ = app.svc.engine.set_repeat(app.transport.repeat);
         }
         KeyCode::Char('r') => {
-            if !app.svc.webapi.lock().is_ok_and(|api| api.is_available()) {
-                app.status =
-                    "daemon catalog unavailable; check daemon status and authorization".into();
-                return false;
+            if let Some(detail) = app.browse.details.last() {
+                let (uri, name) = (detail.context_uri.clone(), detail.title.clone());
+                let id = app.session.detail_request.start();
+                spawn_detail_fetch(app.svc.webapi.clone(), uri, name, id, chans.detail.clone());
+            } else if app.search.searching {
+                let query = app.search.query().to_owned();
+                let id = app.session.search_request.start();
+                app.search.in_flight = true;
+                app.session.search_error = None;
+                spawn_search(app.svc.webapi.clone(), query, id, chans.search.clone());
+            } else {
+                request_library_section(app, chans, true);
             }
-            app.status = "loading library…".to_string();
-            app.browse.library.reset_loading();
-            spawn_library_fetch(
-                app.svc.webapi.clone(),
-                chans.lib.clone(),
-                chans.libdone.clone(),
-            );
         }
         KeyCode::Char('o') => {
             app.browse.sort = app.browse.sort.next();
@@ -173,18 +184,27 @@ pub(crate) fn handle_key(
             if let Some(item) = item {
                 if !item.is_header() && !item.is_play() {
                     // Instant menu (no network), then enrich when the API returns.
-                    app.view.actions = Some(build_action_menu(None, &item));
-                    spawn_action_menu(app.svc.webapi.clone(), item, chans.menu.clone());
+                    app.view.actions = build_action_menu(None, &item).ok();
+                    app.session.menu_error = None;
+                    app.session.menu_item = Some(item.clone());
+                    let id = app.session.menu_request.start();
+                    spawn_action_menu(app.svc.webapi.clone(), item, id, chans.menu.clone());
                 }
             }
         }
         // Tab / Shift+Tab (and [ ]) rotate the library sections.
         KeyCode::Tab | KeyCode::Char(']') => {
+            app.session.search_request.cancel();
+            app.session.detail_request.cancel();
+            app.browse.details.clear();
             app.search.searching = false;
             app.browse.section = app.browse.section.shift(1);
             app.browse.selected = app.first_selectable();
         }
         KeyCode::BackTab | KeyCode::Char('[') => {
+            app.session.search_request.cancel();
+            app.session.detail_request.cancel();
+            app.browse.details.clear();
             app.search.searching = false;
             app.browse.section = app.browse.section.shift(-1);
             app.browse.selected = app.first_selectable();
@@ -226,7 +246,10 @@ pub(crate) fn handle_key(
         KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => play_selected_context(app, false),
         KeyCode::Enter => match app.activate() {
             Activated::Open(uri, name) => {
-                spawn_detail_fetch(app.svc.webapi.clone(), uri, name, chans.detail.clone());
+                app.session.search_request.cancel();
+                app.search.in_flight = false;
+                let id = app.session.detail_request.start();
+                spawn_detail_fetch(app.svc.webapi.clone(), uri, name, id, chans.detail.clone());
             }
             Activated::None => {}
         },

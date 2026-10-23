@@ -59,13 +59,20 @@ fn freeze(snapshot: &mut Snapshot) {
 }
 
 pub fn readiness(snapshot: &mut Snapshot) {
+    if (!snapshot.owned_device_verified || !snapshot.soloist_ready)
+        && snapshot.playback == PlaybackStatus::Playing
+    {
+        freeze(snapshot);
+        snapshot.playback = PlaybackStatus::Disconnected;
+    }
     snapshot.readiness = if snapshot.web_api_ready
+        && snapshot.catalog_available
         && snapshot.soloist_ready
         && snapshot.native_media_ready
         && snapshot.owned_device_verified
     {
         ServiceState::Ready
-    } else if snapshot.locally_active && snapshot.soloist_ready {
+    } else if snapshot.owned_device_verified && snapshot.soloist_ready {
         ServiceState::Degraded
     } else {
         ServiceState::SetupRequired

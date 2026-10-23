@@ -1,14 +1,72 @@
 use std::fmt;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::cache::ResponseCache;
 use super::Authorization;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RETRY_AFTER: u64 = 300;
+// Missing/invalid numeric headers must not turn repeated callers into a busy retry loop.
+const RATE_LIMIT_BACKOFF: u64 = 5;
+const QUOTA_BACKOFF: u64 = 60;
+
+#[derive(Default)]
+struct Cooldown {
+    active: Option<CooldownEntry>,
+}
+
+struct CooldownEntry {
+    started: Instant,
+    delay: Duration,
+    quota: bool,
+}
+
+impl Cooldown {
+    fn record(&mut self, error: &ApiError, retry_after: Option<u64>, now: Instant) {
+        let (seconds, quota) = match error {
+            ApiError::RateLimited { .. } => (retry_after.unwrap_or(RATE_LIMIT_BACKOFF), false),
+            // A quota response with no usable positive delay gets a conservative 60s backoff.
+            ApiError::Quota => (
+                retry_after.filter(|n| *n > 0).unwrap_or(QUOTA_BACKOFF),
+                true,
+            ),
+            _ => return,
+        };
+        self.active = Some(CooldownEntry {
+            started: now,
+            delay: Duration::from_secs(seconds),
+            quota,
+        });
+    }
+
+    fn check(&mut self, now: Instant) -> Result<(), ApiError> {
+        let Some(entry) = &self.active else {
+            return Ok(());
+        };
+        // Never add an untrusted duration to Instant: even u64::MAX seconds is safe here.
+        let remaining = entry
+            .delay
+            .saturating_sub(now.saturating_duration_since(entry.started));
+        if remaining.is_zero() {
+            self.active = None;
+            return Ok(());
+        }
+        if entry.quota {
+            return Err(ApiError::Quota);
+        }
+        // Round up partial seconds, then cap only the redacted public representation.
+        let seconds = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+        Err(ApiError::RateLimited {
+            retry_after_secs: Some(seconds.min(MAX_RETRY_AFTER)),
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +81,7 @@ pub enum HttpMethod {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiError {
+    Busy,
     Unauthorized,
     Restricted,
     NotFound,
@@ -32,12 +91,15 @@ pub enum ApiError {
     Server,
     InvalidRequest,
     InvalidResponse,
+    AmbiguousWrite,
+    CollectionChanged,
     DeviceNotOwned,
 }
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Busy => "Daemon API worker is busy; retry after the pending operation",
             Self::Unauthorized => "Spotify authorization requires setup or renewal",
             Self::Restricted => "Spotify denied this operation",
             Self::NotFound => "Spotify resource was not found",
@@ -47,6 +109,10 @@ impl fmt::Display for ApiError {
             Self::Server => "Spotify service failed",
             Self::InvalidRequest => "Invalid Spotify API request",
             Self::InvalidResponse => "Invalid Spotify API response",
+            Self::AmbiguousWrite => {
+                "Spotify write outcome is uncertain; refresh before trying again"
+            }
+            Self::CollectionChanged => "Spotify collection changed or is incomplete; reload it",
             Self::DeviceNotOwned => "Playback operation requires the verified owned device",
         })
     }
@@ -59,6 +125,8 @@ pub struct ApiClient {
     // Builder failure is retained as a typed error rather than a panic or an unbounded fallback client.
     http: Result<reqwest::blocking::Client, ApiError>,
     owned_device: Option<String>,
+    cache: ResponseCache,
+    cooldown: Cooldown,
 }
 
 impl ApiClient {
@@ -75,6 +143,8 @@ impl ApiClient {
             auth,
             http,
             owned_device: None,
+            cache: ResponseCache::default(),
+            cooldown: Cooldown::default(),
         }
     }
 
@@ -84,13 +154,42 @@ impl ApiClient {
         self.owned_device = device.filter(|id| valid_device_id(id));
     }
 
+    /// Called by the owner worker; a usable, nonexpiring token does no network work.
+    pub fn maintain(&mut self) -> Result<(), ApiError> {
+        let result = self.auth.token().map(|_| ()).map_err(|error| {
+            error
+                .downcast_ref::<ApiError>()
+                .cloned()
+                .unwrap_or(ApiError::Unauthorized)
+        });
+        if result.is_err() {
+            self.cache.invalidate();
+        }
+        result
+    }
+
     pub fn request(
         &mut self,
         method: HttpMethod,
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, ApiError> {
+        if method != HttpMethod::Get {
+            self.cache.invalidate();
+        }
         let url = validate_request(method, path, body.as_ref(), self.owned_device.as_deref())?;
+        if method == HttpMethod::Get && self.cache.contains_fresh(path, Instant::now()) {
+            // Cached data may bypass catalog cooldown, never token expiry/refresh failure.
+            self.maintain()?;
+            // A refresh can outlast the cache TTL; never return the pre-refresh value stale.
+            if let Some(value) = self.cache.get(path, Instant::now()) {
+                return Ok(value);
+            }
+        }
+        self.cooldown.check(Instant::now())?;
+        // Proactive maintain() remains independent of catalog cooldown. Replacing the
+        // authorization through a new ApiClient clears both owner-local cache and cooldown.
+        self.maintain()?;
         let client = self.http.as_ref().map_err(Clone::clone)?;
         let method_http = match method {
             HttpMethod::Get => reqwest::Method::GET,
@@ -101,6 +200,7 @@ impl ApiClient {
         // Never replay mutations: a timeout or server failure can follow an accepted write.
         // GET may retry once on a short explicit rate-limit delay. No unbounded Retry-After sleep.
         for attempt in 0..2 {
+            self.cooldown.check(Instant::now())?;
             let token = self.auth.token().map_err(|error| {
                 error
                     .downcast_ref::<ApiError>()
@@ -113,20 +213,15 @@ impl ApiClient {
             if let Some(body) = &body {
                 request = request.json(body);
             }
-            let response = request.send().map_err(|_| ApiError::Offline)?;
+            let response = request
+                .send()
+                .map_err(|_| outcome_error(method, ApiError::Offline))?;
             let status = response.status().as_u16();
             let retry_after = response
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            if status == 429 && method == HttpMethod::Get && attempt == 0 {
-                if let Some(seconds @ 0..=2) = retry_after {
-                    drop(response);
-                    std::thread::sleep(Duration::from_secs(seconds));
-                    continue;
-                }
-            }
             if !(200..300).contains(&status) {
                 let mut error = classify_status(status, retry_after);
                 if matches!(status, 403 | 429) {
@@ -139,7 +234,18 @@ impl ApiClient {
                         error = ApiError::Quota;
                     }
                 }
-                return Err(error);
+                if matches!(error, ApiError::Unauthorized | ApiError::Restricted) {
+                    self.cache.invalidate();
+                }
+                if error == ApiError::Unauthorized {
+                    self.auth.invalidate_access();
+                }
+                self.cooldown.record(&error, retry_after, Instant::now());
+                if let Some(delay) = short_retry_delay(method, attempt, &error) {
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                return Err(outcome_error(method, error));
             }
             if status == 204 {
                 return Ok(Value::Null);
@@ -148,23 +254,53 @@ impl ApiClient {
                 .content_length()
                 .is_some_and(|n| n > MAX_RESPONSE_BYTES)
             {
-                return Err(ApiError::InvalidResponse);
+                return Err(outcome_error(method, ApiError::InvalidResponse));
             }
             let mut bytes = Vec::new();
             response
                 .take(MAX_RESPONSE_BYTES + 1)
                 .read_to_end(&mut bytes)
-                .map_err(|_| ApiError::Offline)?;
+                .map_err(|_| outcome_error(method, ApiError::Offline))?;
             if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-                return Err(ApiError::InvalidResponse);
+                return Err(outcome_error(method, ApiError::InvalidResponse));
             }
             if bytes.is_empty() {
                 return Ok(Value::Null);
             }
-            return serde_json::from_slice(&bytes).map_err(|_| ApiError::InvalidResponse);
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|_| outcome_error(method, ApiError::InvalidResponse))?;
+            if method == HttpMethod::Get {
+                self.cache.insert(path, &value, Instant::now());
+            }
+            return Ok(value);
         }
         Err(ApiError::Server)
     }
+}
+
+fn outcome_error(method: HttpMethod, error: ApiError) -> ApiError {
+    if method != HttpMethod::Get
+        && matches!(
+            error,
+            ApiError::Offline | ApiError::Server | ApiError::InvalidResponse
+        )
+    {
+        ApiError::AmbiguousWrite
+    } else {
+        error
+    }
+}
+
+fn short_retry_delay(method: HttpMethod, attempt: usize, error: &ApiError) -> Option<Duration> {
+    if method == HttpMethod::Get && attempt == 0 {
+        if let ApiError::RateLimited {
+            retry_after_secs: Some(seconds @ 0..=2),
+        } = error
+        {
+            return Some(Duration::from_secs(*seconds));
+        }
+    }
+    None
 }
 
 fn classify_status(status: u16, retry_after_secs: Option<u64>) -> ApiError {
@@ -173,7 +309,9 @@ fn classify_status(status: u16, retry_after_secs: Option<u64>) -> ApiError {
         402 => ApiError::Quota,
         403 => ApiError::Restricted,
         404 => ApiError::NotFound,
-        429 => ApiError::RateLimited { retry_after_secs },
+        429 => ApiError::RateLimited {
+            retry_after_secs: retry_after_secs.map(|n| n.min(MAX_RETRY_AFTER)),
+        },
         500..=599 => ApiError::Server,
         _ => ApiError::InvalidRequest,
     }
@@ -183,21 +321,25 @@ fn quota_message(bytes: &[u8]) -> bool {
     serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|value| {
-            value
-                .get("error")?
+            let error = value.get("error")?;
+            if error.get("reason").and_then(Value::as_str) == Some("QUOTA_EXCEEDED") {
+                return Some(true);
+            }
+            error
                 .get("message")?
                 .as_str()
-                .map(str::to_owned)
+                .map(|message| message.to_ascii_lowercase().contains("quota"))
         })
-        .is_some_and(|message| message.to_ascii_lowercase().contains("quota"))
+        .unwrap_or(false)
 }
 
 fn parse_retry_after(value: &str) -> Option<u64> {
-    // HTTP-date and oversized/untrusted integers are not used as sleep instructions.
+    // Preserve the full numeric delay for cooldown; only explicit 0..=2 may become a sleep.
+    // HTTP-date and integers outside u64 use the bounded fallback instead.
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    value.parse::<u64>().ok().map(|n| n.min(MAX_RETRY_AFTER))
+    value.parse::<u64>().ok()
 }
 
 fn valid_device_id(id: &str) -> bool {
@@ -208,7 +350,7 @@ fn valid_device_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
-fn validate_request(
+pub(super) fn validate_request(
     method: HttpMethod,
     path: &str,
     body: Option<&Value>,
@@ -371,10 +513,13 @@ mod tests {
         assert!(quota_message(
             br#"{"error":{"message":"Application quota exceeded"}}"#
         ));
+        assert!(quota_message(
+            br#"{"error":{"reason":"QUOTA_EXCEEDED","message":"Denied"}}"#
+        ));
         assert!(!quota_message(
             br#"{"error":{"message":"Insufficient scope"}}"#
         ));
-        assert_eq!(parse_retry_after("99999"), Some(300));
+        assert_eq!(parse_retry_after("99999"), Some(99999));
         assert_eq!(parse_retry_after("-1"), None);
         assert_eq!(parse_retry_after("99999999999999999999999"), None);
         assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
@@ -384,6 +529,207 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HttpMethod::Delete).unwrap(),
             "\"delete\""
+        );
+    }
+
+    #[test]
+    fn uncertain_write_errors_are_redacted_and_known_api_failures_stay_typed() {
+        for method in [HttpMethod::Post, HttpMethod::Put, HttpMethod::Delete] {
+            for error in [
+                ApiError::Offline,
+                ApiError::Server,
+                ApiError::InvalidResponse,
+            ] {
+                assert_eq!(
+                    outcome_error(method, error.clone()),
+                    ApiError::AmbiguousWrite
+                );
+                assert_eq!(outcome_error(HttpMethod::Get, error.clone()), error);
+            }
+            for status in [400, 401, 402, 403, 404, 409, 429] {
+                let error = classify_status(status, Some(47));
+                assert_eq!(outcome_error(method, error.clone()), error);
+            }
+        }
+        assert_eq!(
+            serde_json::to_string(&ApiError::AmbiguousWrite).unwrap(),
+            "\"ambiguous_write\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApiError::CollectionChanged).unwrap(),
+            "\"collection_changed\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiError>("\"ambiguous_write\"").unwrap(),
+            ApiError::AmbiguousWrite
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiError>("\"collection_changed\"").unwrap(),
+            ApiError::CollectionChanged
+        );
+    }
+
+    #[test]
+    fn only_first_get_with_explicit_short_rate_delay_can_retry() {
+        for seconds in [0, 1, 2] {
+            let error = ApiError::RateLimited {
+                retry_after_secs: Some(seconds),
+            };
+            assert_eq!(
+                short_retry_delay(HttpMethod::Get, 0, &error),
+                Some(Duration::from_secs(seconds))
+            );
+            assert_eq!(short_retry_delay(HttpMethod::Get, 1, &error), None);
+            for method in [HttpMethod::Post, HttpMethod::Put, HttpMethod::Delete] {
+                assert_eq!(short_retry_delay(method, 0, &error), None);
+            }
+        }
+        for error in [
+            ApiError::Quota,
+            ApiError::Offline,
+            ApiError::Server,
+            ApiError::RateLimited {
+                retry_after_secs: None,
+            },
+            ApiError::RateLimited {
+                retry_after_secs: Some(3),
+            },
+            ApiError::RateLimited {
+                retry_after_secs: Some(300),
+            },
+        ] {
+            assert_eq!(short_retry_delay(HttpMethod::Get, 0, &error), None);
+        }
+    }
+
+    #[test]
+    fn cooldown_keeps_full_hour_while_reporting_at_most_three_hundred_seconds() {
+        let start = Instant::now();
+        let mut cooldown = Cooldown::default();
+        let delay = parse_retry_after("3600");
+        let error = classify_status(429, delay);
+        assert_eq!(
+            error,
+            ApiError::RateLimited {
+                retry_after_secs: Some(300)
+            }
+        );
+        assert_eq!(short_retry_delay(HttpMethod::Get, 0, &error), None);
+        cooldown.record(&error, delay, start);
+        for elapsed in [0, 300, 301, 1800, 3300] {
+            assert_eq!(
+                cooldown.check(start + Duration::from_secs(elapsed)),
+                Err(ApiError::RateLimited {
+                    retry_after_secs: Some(300)
+                })
+            );
+        }
+        assert_eq!(
+            cooldown.check(start + Duration::from_secs(3599) + Duration::from_nanos(1)),
+            Err(ApiError::RateLimited {
+                retry_after_secs: Some(1)
+            })
+        );
+        assert_eq!(cooldown.check(start + Duration::from_secs(3600)), Ok(()));
+        assert!(cooldown.active.is_none());
+        assert_eq!(cooldown.check(start + Duration::from_secs(3601)), Ok(()));
+    }
+
+    #[test]
+    fn missing_invalid_and_huge_rate_delays_use_safe_constant_space_state() {
+        let start = Instant::now();
+        for raw in [
+            None,
+            Some(""),
+            Some("-1"),
+            Some("1.5"),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+            Some("18446744073709551616"),
+        ] {
+            let delay = raw.and_then(parse_retry_after);
+            assert_eq!(delay, None);
+            let mut cooldown = Cooldown::default();
+            cooldown.record(&classify_status(429, delay), delay, start);
+            assert_eq!(
+                cooldown.check(start),
+                Err(ApiError::RateLimited {
+                    retry_after_secs: Some(RATE_LIMIT_BACKOFF)
+                })
+            );
+            assert_eq!(
+                cooldown.check(start + Duration::from_secs(RATE_LIMIT_BACKOFF)),
+                Ok(())
+            );
+        }
+        let delay = parse_retry_after("18446744073709551615");
+        assert_eq!(delay, Some(u64::MAX));
+        let mut cooldown = Cooldown::default();
+        cooldown.record(&classify_status(429, delay), delay, start);
+        assert_eq!(
+            cooldown.check(start + Duration::from_secs(3600)),
+            Err(ApiError::RateLimited {
+                retry_after_secs: Some(300)
+            })
+        );
+        assert_eq!(
+            cooldown.active.as_ref().unwrap().delay,
+            Duration::from_secs(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn quota_preserves_type_uses_full_delay_or_fallback_and_never_replays_mutations() {
+        let start = Instant::now();
+        for delay in [None, Some(0), Some(3600)] {
+            let seconds = delay.filter(|n| *n > 0).unwrap_or(QUOTA_BACKOFF);
+            let mut cooldown = Cooldown::default();
+            cooldown.record(&ApiError::Quota, delay, start);
+            for method in [
+                HttpMethod::Get,
+                HttpMethod::Post,
+                HttpMethod::Put,
+                HttpMethod::Delete,
+            ] {
+                assert_eq!(short_retry_delay(method, 0, &ApiError::Quota), None);
+                assert_eq!(
+                    cooldown.check(start + Duration::from_secs(seconds - 1)),
+                    Err(ApiError::Quota)
+                );
+                // Blocked calls only check the existing deadline; they never extend it or
+                // register pending work to replay when the deadline elapses.
+                assert_eq!(cooldown.active.as_ref().unwrap().started, start);
+            }
+            assert_eq!(cooldown.check(start + Duration::from_secs(seconds)), Ok(()));
+            assert!(cooldown.active.is_none());
+        }
+    }
+
+    #[test]
+    fn short_get_retry_consumes_only_its_explicit_delay_and_followup_is_still_bounded() {
+        let start = Instant::now();
+        let mut cooldown = Cooldown::default();
+        let first = classify_status(429, Some(2));
+        cooldown.record(&first, Some(2), start);
+        assert_eq!(
+            short_retry_delay(HttpMethod::Get, 0, &first),
+            Some(Duration::from_secs(2))
+        );
+        assert!(cooldown.check(start + Duration::from_secs(1)).is_err());
+        let second_attempt = start + Duration::from_secs(2);
+        assert_eq!(cooldown.check(second_attempt), Ok(()));
+        let second = classify_status(429, Some(3600));
+        cooldown.record(&second, Some(3600), second_attempt);
+        assert_eq!(short_retry_delay(HttpMethod::Get, 1, &second), None);
+        for method in [HttpMethod::Post, HttpMethod::Put, HttpMethod::Delete] {
+            assert_eq!(short_retry_delay(method, 0, &first), None);
+            assert_eq!(short_retry_delay(method, 0, &second), None);
+        }
+        assert!(cooldown
+            .check(second_attempt + Duration::from_secs(300))
+            .is_err());
+        assert_eq!(
+            cooldown.check(second_attempt + Duration::from_secs(3600)),
+            Ok(())
         );
     }
 }

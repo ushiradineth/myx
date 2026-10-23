@@ -43,7 +43,18 @@ pub(crate) fn render_lyrics(f: &mut Frame, app: &App, theme: Theme, area: Rect) 
     }
 
     if app.view.lyrics.is_empty() {
-        let msg = if app.playback.now.is_some() {
+        if app.session.lyrics_error.is_some() {
+            f.render_widget(
+                Paragraph::new("Lyrics request unavailable; metadata and playback are unaffected")
+                    .style(theme.muted())
+                    .alignment(Alignment::Center),
+                center_v(lyrics_area, 1),
+            );
+            return;
+        }
+        let msg = if app.session.lyrics_request.pending() {
+            "loading lyrics…"
+        } else if app.playback.now.is_some() {
             "♪︎  no lyrics for this track"
         } else {
             "♪︎  nothing playing"

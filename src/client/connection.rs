@@ -308,15 +308,19 @@ fn validate_response(response: Response, request_id: u64, config: Option<&str>) 
     // Never echo a peer-provided diagnostic: even a same-user old binary may
     // return configuration contents or provider response bodies.
     let payload = response.result.map_err(|error| {
-        anyhow::anyhow!(match error.code {
-            ErrorCode::ConfigMismatch =>
-                "Daemon uses a different configuration; explicitly restart with --config PATH",
-            ErrorCode::VersionMismatch =>
-                "Incompatible daemon protocol; explicitly stop the existing daemon first",
-            ErrorCode::SetupRequired =>
-                "Setup required; check client_id, Soloist key, SDK and Web API authorization",
-            ErrorCode::Unauthorized =>
-                "Spotify authorization is required or expired; run myx interactively",
+        let message = match error.code {
+            ErrorCode::ConfigMismatch => {
+                "Daemon uses a different configuration; explicitly restart with --config PATH"
+            }
+            ErrorCode::VersionMismatch => {
+                "Incompatible daemon protocol; explicitly stop the existing daemon first"
+            }
+            ErrorCode::SetupRequired => {
+                "Setup required; check client_id, Soloist key, SDK and Web API authorization"
+            }
+            ErrorCode::Unauthorized => {
+                "Spotify authorization is required or expired; run myx interactively"
+            }
             ErrorCode::Restricted => "Spotify denied this operation",
             ErrorCode::NotFound => "Requested resource was not found",
             ErrorCode::Quota => "Spotify application quota reached",
@@ -326,7 +330,16 @@ fn validate_response(response: Response, request_id: u64, config: Option<&str>) 
             ErrorCode::Unavailable => "Daemon operation is unavailable",
             ErrorCode::InvalidRequest => "Daemon rejected this request",
             ErrorCode::Internal => "Daemon operation failed",
-        })
+            ErrorCode::WriteUncertain => {
+                "Spotify write outcome is uncertain; refresh before retrying"
+            }
+            ErrorCode::CollectionChanged => "Collection changed while loading; refresh it",
+        };
+        let mut sanitized = crate::ipc::protocol::IpcError::new(error.code, message);
+        if error.code == ErrorCode::RateLimited {
+            sanitized.retry_after_secs = error.retry_after_secs.map(|seconds| seconds.min(300));
+        }
+        anyhow::Error::new(sanitized)
     })?;
     if let (Some(expected), Payload::Snapshot(snapshot)) = (config, &payload) {
         ensure!(
@@ -526,6 +539,33 @@ impl Drop for DetachedChild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitized_errors_keep_classification_and_bounded_retry_information() {
+        use crate::ipc::protocol::IpcError;
+        let mut error = IpcError::new(ErrorCode::RateLimited, "PRIVATE-PEER-DIAGNOSTIC");
+        error.retry_after_secs = Some(u64::MAX);
+        let response = Response {
+            protocol_version: VERSION,
+            request_id: 17,
+            result: Err(error),
+        };
+        let failure = validate_response(response, 17, None).err().unwrap();
+        let typed = failure.downcast_ref::<IpcError>().unwrap();
+        assert_eq!(typed.code, ErrorCode::RateLimited);
+        assert_eq!(typed.retry_after_secs, Some(300));
+        assert!(!failure.to_string().contains("PRIVATE-PEER"));
+        let response = Response {
+            protocol_version: VERSION,
+            request_id: 18,
+            result: Err(IpcError::new(ErrorCode::WriteUncertain, "PRIVATE")),
+        };
+        let failure = validate_response(response, 18, None).err().unwrap();
+        assert_eq!(
+            failure.downcast_ref::<IpcError>().unwrap().code,
+            ErrorCode::WriteUncertain
+        );
+    }
 
     #[test]
     fn response_must_match_version_id_and_selected_config() {

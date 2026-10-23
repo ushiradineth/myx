@@ -81,6 +81,16 @@ impl Authorization {
         Ok(&self.cached.access_token)
     }
 
+    pub(crate) fn invalidate_access(&mut self) {
+        // Keep refresh material and the on-disk cache intact; the next owner
+        // maintenance/request must refresh, never reuse a rejected access token.
+        self.cached.expires_at = 0;
+    }
+
+    pub(crate) fn commit_cache(&self) -> Result<()> {
+        save_cache(&self.cache_path, &self.cached)
+    }
+
     fn refresh(&mut self) -> Result<()> {
         let refresh = self
             .cached
@@ -97,7 +107,8 @@ impl Authorization {
             response,
             self.cached.refresh_token.clone(),
         )?;
-        // A failed refresh/save never returns the stale access token or destroys the old cache.
+        // A failed refresh/save never returns a stale access token or truncates
+        // the visible cache in place; replacement always publishes whole JSON.
         save_cache(&self.cache_path, &replacement)?;
         self.cached = replacement;
         Ok(())
@@ -187,7 +198,8 @@ impl AuthorizationFlow {
                     ])?;
                     ensure!(!cancel.load(Ordering::Relaxed), "authorization cancelled");
                     let cached = token_cache(&self.client_id, response, None)?;
-                    save_cache(&self.cache_path, &cached)?;
+                    // The owner commits under the refresh lock, preventing an
+                    // older in-flight refresh from overwriting fresh consent.
                     return Ok(Authorization {
                         cached,
                         cache_path: self.cache_path,
@@ -533,6 +545,59 @@ fn save_cache(path: &Path, cached: &Cached) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn consent_material_is_persisted_only_by_the_owners_serialized_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("private")
+            .join("oauth.json");
+        let id = "0".repeat(32);
+        let cached = super::token_cache(
+            &id,
+            super::TokenResponse {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: "Bearer".into(),
+                scope: None,
+            },
+            None,
+        )
+        .unwrap();
+        let auth = super::Authorization {
+            cached,
+            cache_path: path.clone(),
+        };
+        assert!(!path.exists());
+        auth.commit_cache().unwrap();
+        assert!(super::Authorization::load_cached(id, path).is_ok());
+    }
+    #[test]
+    fn rejected_access_is_expired_in_memory_without_destroying_refresh_material() {
+        let cached = super::token_cache(
+            &"0".repeat(32),
+            super::TokenResponse {
+                access_token: "test-access".into(),
+                refresh_token: None,
+                expires_in: 3600,
+                token_type: "Bearer".into(),
+                scope: None,
+            },
+            Some("test-refresh".into()),
+        )
+        .unwrap();
+        let mut auth = super::Authorization {
+            cached,
+            cache_path: std::path::PathBuf::from("/unused/test/cache"),
+        };
+        auth.invalidate_access();
+        assert_eq!(auth.cached.expires_at, 0);
+        assert_eq!(auth.cached.refresh_token.as_deref(), Some("test-refresh"));
+        assert_eq!(auth.cached.access_token, "test-access");
+    }
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 

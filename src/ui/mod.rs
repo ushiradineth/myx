@@ -56,6 +56,12 @@ pub(crate) fn render(f: &mut Frame, app: &App, out: &mut FrameOut, repaint: ArtR
     if !app.status.is_empty() {
         header.push(Span::styled(format!("   {}", app.status), theme.muted()));
     }
+    if app.session.mutation_uncertain {
+        header.push(Span::styled(
+            "   previous library write unconfirmed",
+            theme.muted(),
+        ));
+    }
     f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
     f.render_widget(
         Paragraph::new(Line::from(view_tabs(app, theme))).alignment(Alignment::Right),
