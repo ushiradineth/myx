@@ -161,3 +161,29 @@ fn verification_can_finish_after_the_sdk_play_observation_without_losing_the_tra
     assert_eq!(snapshot.playback, PlaybackStatus::Playing);
     assert!(!pending.is_pending());
 }
+
+#[test]
+fn native_and_client_play_toggle_share_explicit_restore_policy() {
+    use myx::domain::{ItemKind, PlayerCommand, TrackMetadata};
+    let uri = "spotify:track:0123456789abcdefghijkl".to_owned();
+    let mut snapshot = Snapshot::starting("/config".into(), "Player".into());
+    snapshot.track = Some(TrackMetadata::pending(ItemKind::Track, uri.clone()));
+    snapshot.position.position_ms = 1234;
+    for command in [PlayerCommand::Play, PlayerCommand::Toggle] {
+        assert!(matches!(
+            myx::player::controller::prepare_command(command, &snapshot, None, true),
+            PlayerCommand::PlayContext {
+                position_ms: 1234,
+                ..
+            }
+        ));
+    }
+    assert!(matches!(
+        myx::player::controller::prepare_command(PlayerCommand::Toggle, &snapshot, None, false),
+        PlayerCommand::Toggle
+    ));
+    assert!(matches!(
+        myx::player::controller::prepare_command(PlayerCommand::Pause, &snapshot, None, true),
+        PlayerCommand::Pause
+    ));
+}

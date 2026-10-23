@@ -103,3 +103,16 @@ pub fn restored_command(last: Option<PlayerCommand>, snapshot: &Snapshot) -> Pla
         }),
     }
 }
+
+pub fn prepare_command(
+    command: PlayerCommand,
+    snapshot: &Snapshot,
+    last: Option<PlayerCommand>,
+    restore_pending: bool,
+) -> PlayerCommand {
+    if restore_pending && matches!(command, PlayerCommand::Play | PlayerCommand::Toggle) {
+        restored_command(last, snapshot)
+    } else {
+        command
+    }
+}

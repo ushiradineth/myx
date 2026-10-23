@@ -431,9 +431,7 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
                 Ok(OwnerMessage::Command(command, reply)) => {
                     // Timed-out clients must not leave commands queued across setup.
                     if reply.is_disconnected() { continue; }
-                    let command = if restore_pending && matches!(command, PlayerCommand::Play | PlayerCommand::Toggle) {
-                        controller::restored_command(last_intent.clone(), &shared.snapshot())
-                    } else { command };
+                    let command = controller::prepare_command(command, &shared.snapshot(), last_intent.clone(), restore_pending);
                     let proposed_intent = matches!(command, PlayerCommand::PlayContext { .. } | PlayerCommand::PlayTracks { .. }).then(|| command.clone());
                     let stops_restore = matches!(command, PlayerCommand::Stop);
                     let result = if let Some(player) = &player {
@@ -467,7 +465,14 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
             event = media_received.recv_async() => if let (Ok(event), Some(player)) = (event, player.as_ref()) {
                 let mut snapshot = shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(command) = media_command(event, &snapshot) {
+                    let command = controller::prepare_command(command, &snapshot, last_intent.clone(), restore_pending);
+                    let proposed = matches!(command, PlayerCommand::PlayContext { .. } | PlayerCommand::PlayTracks { .. }).then(|| command.clone());
+                    let stopping = matches!(command, PlayerCommand::Stop);
                     if controller::dispatch(player, &mut snapshot, command).is_err() { snapshot.message = Some("Native media command requires ready owned services".into()); }
+                    else {
+                        if let Some(intent) = proposed { last_intent = Some(intent); restore_pending = false; }
+                        if stopping { restore_pending = false; }
+                    }
                     snapshot.sequence = snapshot.sequence.saturating_add(1); shared.changed.notify_all();
                 }
             },
