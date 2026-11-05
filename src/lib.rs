@@ -22,6 +22,12 @@ pub mod daemon;
 pub mod domain;
 pub mod ipc;
 pub mod media;
+pub mod outputs;
+pub mod runtime_bundle;
+
+#[cfg(test)]
+#[path = "../packaging/macos/tests/setup.rs"]
+mod macos_setup_tests;
 pub mod player;
 pub mod service;
 pub mod soloist;

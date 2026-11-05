@@ -1,5 +1,6 @@
 /target
 /result
+/packaging/**/__pycache__/
 
 # local runtime caches (auth tokens, saved state)
 .cache/

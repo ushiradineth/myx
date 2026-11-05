@@ -6,6 +6,7 @@ use std::ffi::CString;
 use std::io;
 use std::mem::size_of;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 // DNS-SD TXT records are length-prefixed strings, without NUL terminators.
@@ -46,6 +47,18 @@ struct PropertyAddress {
 
 #[link(name = "CoreAudio", kind = "framework")]
 unsafe extern "C" {
+    fn AudioObjectAddPropertyListener(
+        object: u32,
+        address: *const PropertyAddress,
+        callback: unsafe extern "C" fn(u32, u32, *const PropertyAddress, *mut libc::c_void) -> i32,
+        context: *mut libc::c_void,
+    ) -> i32;
+    fn AudioObjectRemovePropertyListener(
+        object: u32,
+        address: *const PropertyAddress,
+        callback: unsafe extern "C" fn(u32, u32, *const PropertyAddress, *mut libc::c_void) -> i32,
+        context: *mut libc::c_void,
+    ) -> i32;
     fn AudioObjectGetPropertyData(
         object: u32,
         address: *const PropertyAddress,
@@ -119,6 +132,79 @@ pub fn default_output() -> io::Result<(u32, u32)> {
     let device = read_property(1, *b"dOut")?;
     let frames = read_property(device, *b"fsiz")?;
     Ok((device, frames))
+}
+
+unsafe extern "C" fn output_changed(
+    _: u32,
+    _: u32,
+    _: *const PropertyAddress,
+    context: *mut libc::c_void,
+) -> i32 {
+    // SAFETY: the boxed flag outlives both registered property listeners.
+    unsafe { &*context.cast::<AtomicBool>() }.store(true, Ordering::Release);
+    0
+}
+
+/// Read-only system-object listeners. No microphone or global property writes.
+pub struct OutputListener {
+    changed: Box<AtomicBool>,
+    registered: usize,
+}
+unsafe impl Send for OutputListener {}
+impl OutputListener {
+    fn address(index: usize) -> PropertyAddress {
+        PropertyAddress {
+            selector: u32::from_be_bytes(if index == 0 { *b"dOut" } else { *b"dev#" }),
+            scope: u32::from_be_bytes(*b"glob"),
+            element: 0,
+        }
+    }
+    pub fn new() -> io::Result<Self> {
+        let mut listener = Self {
+            changed: Box::new(AtomicBool::new(false)),
+            registered: 0,
+        };
+        for index in 0..2 {
+            // SAFETY: callback uses only the stable boxed atomic flag.
+            let status = unsafe {
+                AudioObjectAddPropertyListener(
+                    1,
+                    &Self::address(index),
+                    output_changed,
+                    (&*listener.changed as *const AtomicBool).cast_mut().cast(),
+                )
+            };
+            if status != 0 {
+                return Err(api_error("CoreAudio output listener", status));
+            }
+            listener.registered += 1;
+        }
+        Ok(listener)
+    }
+    pub fn take_changed(&self) -> bool {
+        self.changed.swap(false, Ordering::AcqRel)
+    }
+}
+impl Drop for OutputListener {
+    fn drop(&mut self) {
+        for index in 0..self.registered {
+            // SAFETY: remove before releasing the callback's boxed flag.
+            let status = unsafe {
+                AudioObjectRemovePropertyListener(
+                    1,
+                    &Self::address(index),
+                    output_changed,
+                    (&*self.changed as *const AtomicBool).cast_mut().cast(),
+                )
+            };
+            // A failed removal must not leave a dangling callback context.
+            if status != 0 {
+                let flag = std::mem::replace(&mut self.changed, Box::new(AtomicBool::new(false)));
+                Box::leak(flag);
+                break;
+            }
+        }
+    }
 }
 
 #[derive(Default)]

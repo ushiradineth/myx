@@ -12,8 +12,8 @@ use anyhow::{bail, ensure, Context, Result};
 
 use crate::audio::{EqualizerSettings, VisBands};
 use crate::cli::{Cli, DaemonCommand, Mode, ServiceCommand};
-use crate::domain::{PlaybackStatus, PlayerCommand, RepeatMode, Snapshot};
-use crate::ipc::protocol::{Operation, Payload};
+use crate::domain::{PlayerCommand, RepeatMode, Snapshot};
+use crate::ipc::protocol::{Operation, Payload, QueuePage};
 use crate::soloist::protocol::{ObservedMetadata, PlayerEvent};
 use connection::CONTROL_TIMEOUT;
 
@@ -43,6 +43,8 @@ pub struct Player {
     cancelled: Arc<AtomicBool>,
     spectrum: Arc<AtomicBool>,
     events: Arc<EventSink>,
+    queue_requests: flume::Sender<(Option<u64>, usize)>,
+    queue_result: Arc<Mutex<Option<Result<QueuePage>>>>,
 }
 
 /// All producers on this handle share a gate. Even an unbounded UI channel
@@ -98,6 +100,29 @@ impl Player {
             spectrum.clone(),
             events.clone(),
         );
+        let (queue_requests, queue_received) = flume::bounded::<(Option<u64>, usize)>(1);
+        let queue_result = Arc::new(Mutex::new(None));
+        let queue_connection = connection.clone();
+        let queue_cancelled = cancelled.clone();
+        let queue_output = queue_result.clone();
+        thread::Builder::new()
+            .name("myx-queue-view".into())
+            .spawn(move || {
+                while !queue_cancelled.load(Ordering::Acquire) {
+                    let Ok((revision, offset)) =
+                        queue_received.recv_timeout(Duration::from_millis(100))
+                    else {
+                        continue;
+                    };
+                    let result = queue_connection.queue_page(revision, offset, 10, false, true);
+                    if !queue_cancelled.load(Ordering::Acquire) {
+                        *queue_output
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                    }
+                }
+            })
+            .map_err(|_| anyhow::anyhow!("Cannot start queue viewport worker"))?;
         thread::Builder::new()
             .name("myx-watch".into())
             .spawn(move || {
@@ -112,6 +137,8 @@ impl Player {
             cancelled,
             spectrum,
             events,
+            queue_requests,
+            queue_result,
         })
     }
 
@@ -162,6 +189,50 @@ impl Player {
     pub fn play_track_at(&self, uri: String, position_ms: u32) -> Result<()> {
         self.play_context_at(uri, None, position_ms, false)
     }
+    pub fn play_context_at_position(
+        &self,
+        context: String,
+        track: Option<String>,
+        row_position: u32,
+        position_ms: u32,
+        shuffle: bool,
+    ) -> Result<()> {
+        self.command(PlayerCommand::PlayContextAt {
+            uri: context,
+            track,
+            row_position,
+            position_ms,
+            shuffle,
+        })
+    }
+    pub fn play_tracks_at_index(
+        &self,
+        uris: Vec<String>,
+        start_index: u32,
+        position_ms: u32,
+        shuffle: bool,
+    ) -> Result<()> {
+        self.command(PlayerCommand::PlayTracksAt {
+            uris,
+            start_index,
+            position_ms,
+            shuffle,
+        })
+    }
+    pub fn play_liked(
+        &self,
+        start: Option<String>,
+        source_position: Option<u32>,
+        position_ms: u32,
+        shuffle: bool,
+    ) -> Result<()> {
+        self.command(PlayerCommand::PlayLiked {
+            start,
+            source_position,
+            position_ms,
+            shuffle,
+        })
+    }
     pub fn play(&self) -> Result<()> {
         self.command(PlayerCommand::Play)
     }
@@ -207,6 +278,18 @@ impl Player {
     }
     pub fn request_queue(&self) -> Result<()> {
         self.command(PlayerCommand::Queue)
+    }
+    /// Nonblocking viewport demand. One active request and one queued page at most.
+    pub fn request_queue_page(&self, revision: Option<u64>, offset: usize) -> Result<()> {
+        self.queue_requests
+            .try_send((revision, offset))
+            .map_err(|_| anyhow::anyhow!("Queue viewport request is busy"))
+    }
+    pub fn take_queue_page(&self) -> Option<Result<QueuePage>> {
+        self.queue_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
     pub fn add_to_queue(&self, uri: String) -> Result<()> {
         self.command(PlayerCommand::Add { uri })
@@ -362,31 +445,24 @@ fn snapshot_events(previous: Option<&Snapshot>, snapshot: &Snapshot) -> Vec<Play
                 cover_url: track.artwork_url.clone(),
             }));
         }
-        let position_ms = snapshot
-            .position
-            .at(crate::domain::playback::now_ms(), track.duration_ms)
-            .min(u64::from(u32::MAX)) as u32;
-        if track_changed || previous.is_none_or(|s| s.playback != snapshot.playback) {
-            match snapshot.playback {
-                PlaybackStatus::Playing => events.push(PlayerEvent::Playing {
-                    uri: track.uri.clone(),
-                    position_ms,
-                }),
-                PlaybackStatus::Paused => events.push(PlayerEvent::Paused {
-                    uri: track.uri.clone(),
-                    position_ms,
-                }),
-                PlaybackStatus::Stopped => events.push(PlayerEvent::Stopped),
-                _ => {}
-            }
-        }
-    } else if previous.is_none_or(|s| s.track.is_some()) {
-        events.push(PlayerEvent::Stopped);
     }
+    // ReadModel owns playback/anchors, including inactive and buffering states.
+    // Legacy position events would replace canonical timestamp/speed on attach.
     events
 }
 
 pub fn handle_management(cli: &Cli) -> Result<bool> {
+    if let Mode::Config(command) = cli.mode {
+        let source = if command == crate::cli::ConfigCommand::Init && cli.output.is_some() {
+            cli.output.clone()
+        } else {
+            crate::config::Config::path()
+        }
+        .context("Resolve selected configuration path")?;
+        crate::config::setup(command, &source, cli.output.as_deref())?;
+        println!("Configuration operation completed (static validation only; no services started)");
+        return Ok(true);
+    }
     if cli.mode == Mode::Tui {
         return Ok(false);
     }
@@ -480,7 +556,7 @@ pub fn handle_management(cli: &Cli) -> Result<bool> {
             crate::service::uninstall()?;
             println!("Myx service uninstalled");
         }
-        Mode::Tui | Mode::Daemon(DaemonCommand::Run) => unreachable!(),
+        Mode::Tui | Mode::Daemon(DaemonCommand::Run) | Mode::Config(_) => unreachable!(),
     }
     Ok(true)
 }

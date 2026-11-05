@@ -23,7 +23,6 @@ const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_POSITION: u64 = u32::MAX as u64;
 const MAX_TEXT: usize = 4096;
-const MAX_ITEMS: usize = 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +62,11 @@ impl SavedPlayer {
             last_intent: last_intent.filter(|intent| {
                 matches!(
                     intent,
-                    PlayerCommand::PlayContext { .. } | PlayerCommand::PlayTracks { .. }
+                    PlayerCommand::PlayContext { .. }
+                        | PlayerCommand::PlayTracks { .. }
+                        | PlayerCommand::PlayContextAt { .. }
+                        | PlayerCommand::PlayTracksAt { .. }
+                        | PlayerCommand::PlayLiked { .. }
                 )
             }),
         }
@@ -194,10 +197,7 @@ impl SavedPlayer {
                 }
             }
             Some(PlayerCommand::PlayTracks { uris, start, .. }) => {
-                ensure!(
-                    !uris.is_empty() && uris.len() <= MAX_ITEMS,
-                    "Invalid persisted track list"
-                );
+                ensure!(!uris.is_empty(), "Invalid persisted track list");
                 for uri in uris {
                     validate_uri(uri)?;
                 }
@@ -208,6 +208,13 @@ impl SavedPlayer {
                         "Persisted start is outside track list"
                     );
                 }
+            }
+            Some(
+                intent @ (PlayerCommand::PlayContextAt { .. }
+                | PlayerCommand::PlayTracksAt { .. }
+                | PlayerCommand::PlayLiked { .. }),
+            ) => {
+                super::intents::plan(intent)?;
             }
             _ => anyhow::bail!("Invalid persisted player intent"),
         }
@@ -636,6 +643,116 @@ mod tests {
         assert!(SavedPlayer::load(&root.join("absent/player-v1.json"))
             .unwrap()
             .is_none());
+        assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn exact_and_liked_intents_round_trip_paused_without_an_ack_becoming_observation() {
+        let directory = private_temp();
+        let root = directory.path().canonicalize().unwrap();
+        for (index, intent) in [
+            PlayerCommand::PlayContextAt {
+                uri: "spotify:playlist:0123456789abcdefghijkl".into(),
+                track: Some("spotify:track:0123456789abcdefghijkl".into()),
+                row_position: 37,
+                position_ms: 999,
+                shuffle: false,
+            },
+            PlayerCommand::PlayTracksAt {
+                uris: vec![
+                    "spotify:track:0123456789abcdefghijkl".into(),
+                    "spotify:track:0123456789abcdefghijkl".into(),
+                ],
+                start_index: 1,
+                position_ms: 999,
+                shuffle: false,
+            },
+            PlayerCommand::PlayLiked {
+                start: Some("spotify:track:0123456789abcdefghijkl".into()),
+                source_position: Some(5106),
+                position_ms: 999,
+                shuffle: false,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut state = fixture();
+            state.track.as_mut().unwrap().uri = "spotify:track:0123456789abcdefghijkl".into();
+            state.last_intent = Some(intent.clone());
+            let path = root.join(format!("player-{index}.json"));
+            state.save(&path).unwrap();
+            let loaded = SavedPlayer::load(&path).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&loaded.last_intent).unwrap(),
+                serde_json::to_value(Some(intent)).unwrap()
+            );
+            let mut snapshot = Snapshot::starting("other".into(), "other".into());
+            loaded.apply(&mut snapshot);
+            assert_eq!(snapshot.playback, PlaybackStatus::Paused);
+            assert_eq!(snapshot.position.position_ms, 4200);
+            assert!(!snapshot.locally_active && !snapshot.owned_device_verified);
+            let restored =
+                crate::player::controller::restored_command(loaded.last_intent, &snapshot);
+            let value = serde_json::to_value(restored).unwrap();
+            assert_eq!(value["position_ms"], 4200);
+            assert_eq!(value["shuffle"], true);
+            match index {
+                0 => assert_eq!(value["row_position"], 37),
+                1 => assert_eq!(value["start_index"], 1),
+                2 => assert_eq!(value["source_position"], 5106),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn complete_large_source_persists_without_the_old_item_cap() {
+        let directory = private_temp();
+        let path = directory.path().canonicalize().unwrap().join("player.json");
+        let mut state = fixture();
+        state.track.as_mut().unwrap().uri = "spotify:track:0123456789abcdefghijkl".into();
+        state.last_intent = Some(PlayerCommand::PlayTracksAt {
+            uris: (0..5107)
+                .map(|id| format!("spotify:track:{id:022}"))
+                .collect(),
+            start_index: 2553,
+            position_ms: 0,
+            shuffle: true,
+        });
+        state.save(&path).unwrap();
+        let loaded = SavedPlayer::load(&path).unwrap().unwrap();
+        let Some(PlayerCommand::PlayTracksAt {
+            uris, start_index, ..
+        }) = loaded.last_intent
+        else {
+            panic!("lost explicit source");
+        };
+        assert_eq!(uris.len(), 5107);
+        assert_eq!(uris[0], format!("spotify:track:{:022}", 0));
+        assert_eq!(uris[5106], format!("spotify:track:{:022}", 5106));
+        assert_eq!(start_index, 2553);
+    }
+
+    #[test]
+    fn complete_source_still_obeys_the_persisted_byte_bound() {
+        let directory = private_temp();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("player.json");
+        let mut state = fixture();
+        state.track.as_mut().unwrap().uri = "spotify:track:0123456789abcdefghijkl".into();
+        state.last_intent = Some(PlayerCommand::PlayTracksAt {
+            uris: vec!["spotify:track:0123456789abcdefghijkl".into(); 30_000],
+            start_index: 0,
+            position_ms: 0,
+            shuffle: false,
+        });
+        assert!(state
+            .save(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("size bound"));
+        assert!(!path.exists());
         assert_eq!(fs::read_dir(root).unwrap().count(), 0);
     }
 

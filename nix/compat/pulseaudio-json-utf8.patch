@@ -1,0 +1,12 @@
+--- a/src/pulsecore/json.c
++++ b/src/pulsecore/json.c
+@@ -765,5 +765,7 @@ static char *pa_json_escape(const char *p) {
+-                if (*s < 0x20 || *s > 0x7E) {
+-                    pa_log("Invalid non-ASCII character: 0x%x", (unsigned int) *s);
++                /* JSON permits UTF-8 bytes; only unescaped control bytes
++                 * are invalid here, including on signed-char platforms. */
++                if ((unsigned char) *s < 0x20) {
++                    pa_log("Invalid control character: 0x%x", (unsigned int) *s);
+                     pa_xfree(out_string);
+                     return NULL;
+                 }

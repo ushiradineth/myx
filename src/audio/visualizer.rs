@@ -60,19 +60,22 @@ pub(crate) struct SpectrumAnalyzer {
     fft: Arc<dyn rustfft::Fft<f32>>,
     hann_window: Vec<f32>,
     fft_buf: Vec<Complex<f32>>,
+    fft_scratch: Vec<Complex<f32>>,
     magnitudes: Vec<f32>,
     sample_rate: f32,
     band_ranges: Vec<(usize, usize)>,
     new_bands: [f32; NUM_BANDS],
     smooth_scratch: [f32; NUM_BANDS],
-    #[cfg(test)]
     fft_frames: usize,
+    fft_compute_nanos: u64,
+    fft_peak_nanos: u64,
 }
 
 impl SpectrumAnalyzer {
     pub(crate) fn new(bands: Arc<Mutex<VisBands>>, sample_rate: f32) -> Self {
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
+        let fft_scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
         let hann_window: Vec<f32> = (0..FFT_SIZE)
             .map(|i| {
                 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32).cos())
@@ -85,31 +88,42 @@ impl SpectrumAnalyzer {
             fft,
             hann_window,
             fft_buf: vec![Complex::new(0.0, 0.0); FFT_SIZE],
+            fft_scratch,
             magnitudes: vec![0.0; FFT_SIZE / 2],
             sample_rate,
             band_ranges,
             new_bands: [0.0; NUM_BANDS],
             smooth_scratch: [0.0; NUM_BANDS],
-            #[cfg(test)]
             fft_frames: 0,
+            fft_compute_nanos: 0,
+            fft_peak_nanos: 0,
         }
     }
 }
 
 impl SpectrumAnalyzer {
-    #[cfg(test)]
     pub(crate) fn fft_frames(&self) -> usize {
         self.fft_frames
     }
+    pub(crate) fn fft_compute_micros(&self) -> u64 {
+        self.fft_compute_nanos / 1000
+    }
+    pub(crate) fn peak_fft_compute_micros(&self) -> u64 {
+        self.fft_peak_nanos.div_ceil(1000)
+    }
 
-    pub(crate) fn reset(&mut self) {
-        if let Ok(mut g) = self.bands.try_lock() {
+    pub(crate) fn reset(&mut self) -> bool {
+        let cleared = if let Ok(mut g) = self.bands.try_lock() {
             g.values.fill(0.0);
             g.peak_envelope = 1e-6;
             g.updated_at = Instant::now();
             g.is_active = false;
-        }
+            true
+        } else {
+            false
+        };
         self.sample_buf.clear();
+        cleared
     }
 
     pub(crate) fn process(&mut self, samples: &[f64], enabled: &AtomicBool) {
@@ -155,11 +169,13 @@ impl SpectrumAnalyzer {
                 }
             }
 
-            self.fft.process(&mut self.fft_buf);
-            #[cfg(test)]
-            {
-                self.fft_frames += 1;
-            }
+            let started = Instant::now();
+            self.fft
+                .process_with_scratch(&mut self.fft_buf, &mut self.fft_scratch);
+            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            self.fft_compute_nanos = self.fft_compute_nanos.saturating_add(elapsed);
+            self.fft_peak_nanos = self.fft_peak_nanos.max(elapsed);
+            self.fft_frames += 1;
 
             for (mag, c) in self.magnitudes.iter_mut().zip(self.fft_buf.iter()) {
                 *mag = c.norm();

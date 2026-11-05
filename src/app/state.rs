@@ -68,6 +68,10 @@ impl ThemeState {
 
 /// The daemon's transport read model, with optimistic local control feedback.
 pub(crate) struct Transport {
+    pub(crate) canonical: Box<Snapshot>,
+    pub(crate) queue_offset: usize,
+    pub(crate) queue_total: usize,
+    pub(crate) queue_revision: u64,
     pub(crate) shuffle: bool,
     pub(crate) repeat: RepeatMode,
     pub(crate) volume: u8, // 0..=100 (mirrors the 50% mixer default)
@@ -85,6 +89,10 @@ impl Transport {
     /// Attaching is a read. Only subsequent explicit input may send controls.
     pub(crate) fn from_snapshot(snapshot: &Snapshot) -> Self {
         Self {
+            canonical: Box::new(snapshot.clone()),
+            queue_offset: 0,
+            queue_total: snapshot.queue_upcoming_total,
+            queue_revision: snapshot.queue_revision,
             shuffle: snapshot.shuffle,
             repeat: snapshot.repeat,
             volume: snapshot.volume,
@@ -92,7 +100,12 @@ impl Transport {
                 .queue
                 .upcoming
                 .iter()
-                .map(|entry| entry.title.clone().unwrap_or_default())
+                .map(|entry| {
+                    entry
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Loading metadata…".into())
+                })
                 .collect(),
             queue_uris: snapshot
                 .queue

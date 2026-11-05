@@ -10,7 +10,7 @@ fn more_than_five_thousand_liked_tracks_are_delivered_only_after_the_last_page()
         assert!(path.starts_with("/v1/me/tracks?"));
         let end = (offset + 50).min(5107);
         let items: Vec<_> = (offset..end).map(|id| json!({"track": {
-            "uri":format!("spotify:track:{id}"),"name":format!("Track {id}"),"artists":[{"name":"Artist"}]
+            "uri":format!("spotify:track:{id:022}"),"name":format!("Track {id}"),"artists":[{"name":"Artist"}]
         }})).collect();
         offset = end;
         calls += 1;
@@ -18,7 +18,55 @@ fn more_than_five_thousand_liked_tracks_are_delivered_only_after_the_last_page()
     }, Section::Liked).unwrap();
     assert_eq!(calls, 103);
     assert_eq!(rows.iter().filter(|row| row.is_track()).count(), 5107);
-    assert_eq!(rows.last().unwrap().uri, "spotify:track:5106");
+    assert_eq!(
+        rows.last().unwrap().uri,
+        format!("spotify:track:{:022}", 5106)
+    );
+    assert_eq!(rows.last().unwrap().source_position, Some(5106));
+}
+
+#[test]
+fn liked_headers_and_unavailable_rows_do_not_change_authoritative_selection() {
+    let entries = vec![
+        json!({"track":{"name":"Z","uri":"spotify:track:0123456789abcdefghijkl"}}),
+        Value::Null,
+        json!({"track":null}),
+        json!({"track":{"name":"Unavailable","uri":"spotify:track:1123456789abcdefghijkl","is_playable":false}}),
+        json!({"track":{"name":"A duplicate","uri":"spotify:track:0123456789abcdefghijkl"}}),
+    ];
+    let mut rows = fetch_section_with(
+        |_| Ok(json!({"items":entries,"next":null,"total":5})),
+        Section::Liked,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert!(rows[0].is_play());
+    assert!(rows[1].is_header());
+    assert_eq!(rows[0].source_position, None);
+    assert_eq!(rows[1].source_position, None);
+    sort_list(&mut rows, SortMode::Title);
+    let selected = &rows[2];
+    assert_eq!(selected.name, "A duplicate");
+    assert_eq!(selected.source_position, Some(4));
+    let command = myx::domain::PlayerCommand::PlayLiked {
+        start: Some(selected.uri.clone()),
+        source_position: selected.source_position,
+        position_ms: 0,
+        shuffle: true,
+    };
+    let myx::player::intents::LoadPlan::WebApi { body, .. } =
+        myx::player::intents::resolve_liked(&command, &entries).unwrap()
+    else {
+        panic!("expected full source");
+    };
+    assert_eq!(
+        body["uris"],
+        json!([
+            "spotify:track:0123456789abcdefghijkl",
+            "spotify:track:0123456789abcdefghijkl"
+        ])
+    );
+    assert_eq!(body["offset"], json!({"position":1}));
 }
 
 #[test]

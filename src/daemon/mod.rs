@@ -1,12 +1,14 @@
 //! Sole per-user owner of authorization, SDK, processed audio and native media.
 mod api_gate;
 mod lifecycle;
+mod playback;
+mod queue;
 pub mod server;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -25,7 +27,7 @@ use crate::soloist::{protocol::PlayerEvent, RuntimePlayer};
 use crate::webapi::{ApiClient, ApiError, Authorization, AuthorizationFlow, HttpMethod};
 
 enum OwnerMessage {
-    Command(PlayerCommand, flume::Sender<Result<(), IpcError>>),
+    Command(PlayerCommand, u64, flume::Sender<Result<(), IpcError>>),
     RetryServices,
 }
 
@@ -35,11 +37,16 @@ struct Shared {
     shutdown: Arc<AtomicBool>,
     api: Mutex<Option<ApiClient>>,
     api_gate: Arc<api_gate::ApiGate>,
+    publisher: Mutex<Option<crate::outputs::now_playing::Publisher>>,
     device: Mutex<Option<String>>,
     subscriptions: Mutex<HashMap<String, (Instant, bool)>>,
     oauth: AtomicBool,
     generation: AtomicU64,
     commands: flume::Sender<OwnerMessage>,
+    control: OnceLock<playback::Control>,
+    lifetime: OnceLock<std::fs::File>,
+    native_queue: Mutex<queue::NativeQueue>,
+    observations: AtomicU64,
 }
 
 impl Shared {
@@ -104,12 +111,38 @@ impl Shared {
         edit(&mut snapshot);
         snapshot.sequence = snapshot.sequence.saturating_add(1);
         self.changed.notify_all();
-    }
-    fn snapshot(&self) -> Snapshot {
-        self.snapshot
+        let value = snapshot.clone();
+        drop(snapshot);
+        if let Some(publisher) = self
+            .publisher
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .as_ref()
+        {
+            publisher.submit(value);
+        }
+    }
+    fn snapshot(&self) -> Snapshot {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        snapshot.output_error = self
+            .publisher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|publisher| publisher.error());
+        snapshot.spectrum_subscribers = self
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|(until, enabled)| *enabled && *until > Instant::now())
+            .count()
+            .min(u32::MAX as usize) as u32;
+        snapshot
     }
     fn status(&self) -> Snapshot {
         let mut snapshot = self.snapshot();
@@ -137,6 +170,87 @@ impl Shared {
         }
         match operation {
             Operation::Status => Ok(Payload::Snapshot(Box::new(self.status()))),
+            Operation::QueuePage {
+                revision,
+                offset,
+                limit,
+                previous,
+                metadata,
+            } => {
+                let generation = self.generation.load(Ordering::Acquire);
+                let mut page = self
+                    .native_queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .page(revision, offset, limit, previous)?;
+                let authority = self.snapshot();
+                page.session_id = authority.session_id;
+                page.auth_revision = authority.auth_revision;
+                if metadata {
+                    // At most two bounded batch requests, only for the requested viewport.
+                    for (kind, endpoint) in [("track", "tracks"), ("episode", "episodes")] {
+                        let ids: Vec<_> = page
+                            .entries
+                            .iter()
+                            .filter(|entry| {
+                                entry.title.is_none()
+                                    && crate::player::intents::valid_uri(&entry.uri, &[kind])
+                            })
+                            .filter_map(|entry| entry.uri.rsplit(':').next())
+                            .collect();
+                        if ids.is_empty() {
+                            continue;
+                        }
+                        let response = self.api_call(
+                            generation,
+                            HttpMethod::Get,
+                            &format!("/v1/{endpoint}?ids={}", ids.join(",")),
+                            None,
+                        );
+                        if self.shutdown.load(Ordering::Acquire)
+                            || self.generation.load(Ordering::Acquire) != generation
+                        {
+                            return Err(IpcError::new(
+                                ErrorCode::CollectionChanged,
+                                "Queue authority changed",
+                            ));
+                        }
+                        if let Ok(value) = response {
+                            if let Some(items) = value[endpoint].as_array() {
+                                let mut queue = self
+                                    .native_queue
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                for item in items {
+                                    if let (Some(uri), Some(title)) = (
+                                        item["uri"].as_str(),
+                                        item["name"].as_str().filter(|title| !title.is_empty()),
+                                    ) {
+                                        queue.remember(uri.to_owned(), title.to_owned());
+                                        for entry in &mut page.entries {
+                                            if entry.uri == uri {
+                                                entry.title = Some(title.to_owned());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Do not return old coordinates after metadata HTTP raced a queue update.
+                self.native_queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .page(Some(page.revision), offset, limit, previous)?;
+                if self.generation.load(Ordering::Acquire) != generation {
+                    return Err(IpcError::new(
+                        ErrorCode::CollectionChanged,
+                        "Queue authority changed",
+                    ));
+                }
+                Ok(Payload::QueuePage(page))
+            }
             Operation::Watch {
                 after,
                 client_id,
@@ -215,7 +329,11 @@ impl Shared {
             Operation::Player(command) => {
                 let (reply, result) = flume::bounded(1);
                 self.commands
-                    .try_send(OwnerMessage::Command(command, reply))
+                    .try_send(OwnerMessage::Command(
+                        command,
+                        self.generation.load(Ordering::Acquire),
+                        reply,
+                    ))
                     .map_err(|_| IpcError::new(ErrorCode::Busy, "Player command queue is busy"))?;
                 result.recv_timeout(Duration::from_secs(2)).map_err(|_| {
                     IpcError::new(
@@ -274,11 +392,19 @@ impl Shared {
                             shared.oauth.store(false,Ordering::Release);
                             return;
                         }
-                        shared.generation.fetch_add(1, Ordering::AcqRel);
+                         shared.generation.fetch_add(1, Ordering::AcqRel);
+                         let queue_revision = shared.native_queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear_authority();
                         shared.update(|snapshot| {
                             snapshot.auth_revision = snapshot.auth_revision.saturating_add(1);
                             snapshot.owned_device_verified = false;
-                            snapshot.catalog_available = false;
+                             snapshot.catalog_available = false;
+                             snapshot.queue = Default::default();
+                             snapshot.queue_revision = queue_revision;
+                             snapshot.queue_previous_total = 0;
+                             snapshot.queue_upcoming_total = 0;
+                             snapshot.options_observed_revision = 0;
+                             snapshot.volume_observed_revision = 0;
+                             snapshot.control_pending = false;
                             reducer::readiness(snapshot);
                         });
                         *shared
@@ -349,8 +475,32 @@ fn api_error(error: ApiError) -> IpcError {
 
 pub fn run() -> Result<()> {
     config::get().validate()?;
-    lifecycle::install();
     let path = Config::path().context("Resolve daemon configuration")?;
+    if let Some(bundle) = crate::runtime_bundle::discover()? {
+        let settings = config::get();
+        let soloist = &settings.soloist;
+        let mut user_paths = vec![
+            path.clone(),
+            cache_path()?,
+            RuntimePaths::for_user()?.directory,
+            soloist.directory()?,
+            soloist.resolve(soloist.sdk.as_ref(), "assets/soloist")?,
+            soloist.resolve(soloist.data_dir.as_ref(), "data")?,
+            soloist.resolve(soloist.cache_dir.as_ref(), "cache")?,
+        ];
+        if soloist.api_key.is_none() {
+            user_paths.push(soloist.resolve(soloist.api_key_file.as_ref(), "api-key")?);
+        }
+        if settings.now_playing.enabled {
+            if let Some(output) = &settings.now_playing.path {
+                user_paths.push(soloist.resolve(Some(output), "")?);
+            }
+        }
+        for path in user_paths {
+            bundle.ensure_external_user_path(&path)?;
+        }
+    }
+    lifecycle::install();
     let (commands, receiver) = flume::bounded(64);
     let shared = Arc::new(Shared {
         snapshot: Mutex::new(Snapshot::starting(
@@ -361,11 +511,16 @@ pub fn run() -> Result<()> {
         shutdown: Arc::new(AtomicBool::new(false)),
         api: Mutex::new(None),
         api_gate: Arc::new(api_gate::ApiGate::default()),
+        publisher: Mutex::new(None),
         device: Mutex::new(None),
         subscriptions: Mutex::new(HashMap::new()),
         oauth: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         commands,
+        control: OnceLock::new(),
+        lifetime: OnceLock::new(),
+        native_queue: Mutex::new(queue::NativeQueue::default()),
+        observations: AtomicU64::new(0),
     });
     shared.update(|snapshot| snapshot.volume = config::get().soloist.initial_volume);
     let handler_shared = shared.clone();
@@ -374,7 +529,38 @@ pub fn run() -> Result<()> {
         path.to_string_lossy().into_owned(),
         Arc::new(move |operation| handler_shared.handle(operation)),
     )?;
+    // Clone the actual locked open file description, never reopen its pathname.
+    shared
+        .lifetime
+        .set(server.publisher_lock()?)
+        .map_err(|_| anyhow::anyhow!("Daemon lifetime lock already installed"))?;
+    shared
+        .control
+        .set(playback::Control::start(shared.clone())?)
+        .map_err(|_| anyhow::anyhow!("Control worker already installed"))?;
     let owner_shared = shared.clone();
+    if config::get().now_playing.enabled {
+        let soloist = &config::get().soloist;
+        let protected = vec![
+            path.clone(),
+            cache_path()?,
+            soloist.directory()?,
+            soloist.resolve(soloist.api_key_file.as_ref(), "api-key")?,
+            soloist.resolve(soloist.data_dir.as_ref(), "data")?,
+            soloist.resolve(soloist.cache_dir.as_ref(), "cache")?,
+            RuntimePaths::for_user()?.directory,
+        ];
+        let publisher = crate::outputs::now_playing::Publisher::start_owned(
+            &config::get().now_playing,
+            &protected,
+            shared.snapshot(),
+            server.publisher_lock()?,
+        );
+        *shared
+            .publisher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(publisher);
+    }
     let result = crate::media::run(shared.shutdown.clone(), move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -384,14 +570,21 @@ pub fn run() -> Result<()> {
     });
     shared.shutdown.store(true, Ordering::Release);
     shared.changed.notify_all();
+    let final_output = shared
+        .publisher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .map(|publisher| publisher.finish())
+        .unwrap_or(Ok(()));
     server.stop();
-    result
+    result.and(final_output)
 }
 
 async fn start_player(
     shared: &Shared,
     events: &flume::Sender<PlayerEvent>,
-) -> Option<RuntimePlayer> {
+) -> Option<Arc<RuntimePlayer>> {
     if !shared.snapshot().web_api_ready
         || shared.shutdown.load(Ordering::Acquire)
         || lifecycle::signalled()
@@ -418,7 +611,7 @@ async fn start_player(
                 snapshot.message =
                     Some("Waiting for Soloist authentication and owned-device verification".into());
             });
-            Some(player)
+            Some(Arc::new(player))
         }
         Err(_) => {
             shared.update(|snapshot| { snapshot.readiness = ServiceState::SetupRequired; snapshot.message = Some("Soloist SDK/key/audio setup is required; fix configuration and explicitly restart".into()); });
@@ -488,9 +681,24 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
     let mut last_media = u64::MAX;
     let mut last_persist = Instant::now();
     let mut pending_playback = reducer::PendingPlayback::default();
+    let mut sdk_authenticated = false;
+    let mut pcm_baseline = 0;
     while !shared.shutdown.load(Ordering::Acquire) && !lifecycle::signalled() {
         let wants_spectrum = shared.has_spectrum();
         if let Some(player) = &player {
+            if let Some(stats) = player.audio_stats() {
+                let ready = sdk_authenticated && player.has_local_dsp();
+                if !ready {
+                    pcm_baseline = stats.processed_frames;
+                }
+                shared.update(|snapshot| {
+                    snapshot.audio = Some(audio_telemetry(stats));
+                    if snapshot.soloist_ready != ready {
+                        snapshot.soloist_ready = ready;
+                        reducer::readiness(snapshot);
+                    }
+                });
+            }
             let snapshot = shared.snapshot();
             player.set_verified(
                 snapshot.owned_device_verified && snapshot.soloist_ready && snapshot.locally_active,
@@ -506,16 +714,19 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
         };
         tokio::select! {
             message = commands.recv_async() => match message {
-                Ok(OwnerMessage::Command(command, reply)) => {
+                Ok(OwnerMessage::Command(command, generation, reply)) => {
                     // Timed-out clients must not leave commands queued across setup.
                     if reply.is_disconnected() { continue; }
+                    if shared.generation.load(Ordering::Acquire) != generation {
+                        let _ = reply.try_send(Err(IpcError::new(ErrorCode::SetupRequired, "Authorization changed before command acceptance")));
+                        continue;
+                    }
                     let command = controller::prepare_command(command, &shared.snapshot(), last_intent.clone(), restore_pending);
-                    let proposed_intent = matches!(command, PlayerCommand::PlayContext { .. } | PlayerCommand::PlayTracks { .. }).then(|| command.clone());
+                    let proposed_intent = playback::is_load(&command).then(|| command.clone());
                     let stops_restore = matches!(command, PlayerCommand::Stop);
                     let result = if let Some(player) = &player {
-                        let mut snapshot = shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let result = controller::dispatch(player, &mut snapshot, command).map_err(|_| IpcError::new(ErrorCode::SetupRequired, "Player operation failed; inspect required services and owned-device state"));
-                        snapshot.sequence = snapshot.sequence.saturating_add(1); shared.changed.notify_all(); result
+                        shared.control.get().ok_or_else(|| IpcError::new(ErrorCode::Unavailable, "Control worker unavailable"))
+                            .and_then(|control| control.enqueue(&shared, player.clone(), command, generation))
                     } else { Err(IpcError::new(ErrorCode::SetupRequired, "Required player services need setup")) };
                     if result.is_ok() {
                         if let Some(intent) = proposed_intent { last_intent = Some(intent); restore_pending = false; }
@@ -527,32 +738,87 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
                 Err(_) => break,
             },
             event = observed.recv_async() => if let Ok(event) = event {
+                // A stopped read model can be re-established by Playing without
+                // another SDK TrackChanged. Old processed frames cannot qualify it.
+                if matches!(&event, PlayerEvent::TrackChanged { .. })
+                    || (matches!(&event, PlayerEvent::Playing { .. }) && shared.snapshot().track.is_none())
+                {
+                    pcm_baseline = player.as_ref().and_then(|player| player.audio_stats()).map_or(0, |stats| stats.processed_frames);
+                }
+                match &event {
+                    PlayerEvent::Authentication { logged_in, .. } => sdk_authenticated = *logged_in,
+                    PlayerEvent::Reconnecting => sdk_authenticated = false,
+                    _ => {},
+                }
+                if matches!(&event,PlayerEvent::TrackChanged {..}|PlayerEvent::Stopped|PlayerEvent::Reconnecting|PlayerEvent::LocallyInactive) {
+                    if let Some(player)=&player {player.flush_audio();}
+                }
                 pending_playback.note(&event);
                 let previous = shared.snapshot();
                 if matches!(event, PlayerEvent::Authentication { logged_in: false, .. }) && (previous.soloist_ready || previous.owned_device_verified) {
-                    shared.generation.fetch_add(1, Ordering::AcqRel);
+                     shared.generation.fetch_add(1, Ordering::AcqRel);
+                     let queue_revision = shared.native_queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear_authority();
+                     shared.update(|snapshot| {
+                         snapshot.queue = Default::default(); snapshot.queue_revision = queue_revision;
+                         snapshot.queue_previous_total = 0; snapshot.queue_upcoming_total = 0;
+                         snapshot.options_observed_revision = 0; snapshot.volume_observed_revision = 0;
+                         snapshot.control_pending = false;
+                         snapshot.control_error = Some(ErrorCode::SetupRequired);
+                         snapshot.control_outcome = Some("Control cancelled after SDK authorization changed".into());
+                     });
                     *shared.device.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
-                let pcm = player.as_ref().and_then(RuntimePlayer::audio_stats).is_some_and(|stats| stats.processed_frames > 0);
+                let event = if let PlayerEvent::NativeQueue(queue) = event {
+                    if previous.locally_active {
+                        let mut native = shared.native_queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        native.observe(queue);
+                        let mut prefix = previous.clone();
+                        native.prefix(&mut prefix);
+                        drop(native);
+                        shared.update(|snapshot| {
+                            snapshot.queue = prefix.queue;
+                            snapshot.queue_revision = prefix.queue_revision;
+                            snapshot.queue_previous_total = prefix.queue_previous_total;
+                            snapshot.queue_upcoming_total = prefix.queue_upcoming_total;
+                            snapshot.queue_observed_revision = snapshot.queue_observed_revision.saturating_add(1);
+                        });
+                    }
+                    shared.observations.fetch_add(1, Ordering::AcqRel);
+                    shared.changed.notify_all();
+                    continue;
+                } else { event };
+                let pcm = player.as_ref().and_then(|player| player.audio_stats()).is_some_and(|stats| stats.processed_frames > pcm_baseline);
                 shared.update(|snapshot| {
+                    if snapshot.locally_active {
+                        match &event {
+                            PlayerEvent::Options { .. } => snapshot.options_observed_revision = snapshot.options_observed_revision.saturating_add(1),
+                            PlayerEvent::Volume { .. } => snapshot.volume_observed_revision = snapshot.volume_observed_revision.saturating_add(1),
+                            _ => {}
+                        }
+                    }
                     reducer::observe(snapshot, event, pcm);
                     if player.as_ref().is_some_and(|player| !player.has_local_dsp()) {
                         snapshot.soloist_ready = false; reducer::readiness(snapshot);
                     }
                 });
+                shared.observations.fetch_add(1, Ordering::AcqRel);
+                shared.changed.notify_all();
             },
             event = media_received.recv_async() => if let (Ok(event), Some(player)) = (event, player.as_ref()) {
-                let mut snapshot = shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let name=match &event { MediaControlEvent::Play=>"play",MediaControlEvent::Pause=>"pause",MediaControlEvent::Toggle=>"toggle",
+                    MediaControlEvent::Stop=>"stop",MediaControlEvent::Next=>"next",MediaControlEvent::Previous=>"previous",_=>"other" };
+                shared.update(|snapshot| {snapshot.media_event_count=snapshot.media_event_count.saturating_add(1);snapshot.last_media_command=Some(name.into());});
+                let generation = shared.generation.load(Ordering::Acquire);
+                let snapshot = shared.snapshot();
                 if let Some(command) = media_command(event, &snapshot) {
                     let command = controller::prepare_command(command, &snapshot, last_intent.clone(), restore_pending);
-                    let proposed = matches!(command, PlayerCommand::PlayContext { .. } | PlayerCommand::PlayTracks { .. }).then(|| command.clone());
+                    let proposed = playback::is_load(&command).then(|| command.clone());
                     let stopping = matches!(command, PlayerCommand::Stop);
-                    if controller::dispatch(player, &mut snapshot, command).is_err() { snapshot.message = Some("Native media command requires ready owned services".into()); }
+                    if shared.control.get().is_none_or(|control| control.enqueue(&shared, player.clone(), command, generation).is_err()) { shared.update(|snapshot| snapshot.message = Some("Native media command requires ready owned services".into())); }
                     else {
                         if let Some(intent) = proposed { last_intent = Some(intent); restore_pending = false; }
                         if stopping { restore_pending = false; }
                     }
-                    snapshot.sequence = snapshot.sequence.saturating_add(1); shared.changed.notify_all();
                 }
             },
             _ = tokio::time::sleep(interval) => {},
@@ -572,6 +838,25 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
             shared.update(|snapshot| snapshot.spectrum = None);
         }
         let snapshot = shared.snapshot();
+        if !pending_playback.is_pending()
+            && snapshot.playback == PlaybackStatus::Disconnected
+            && snapshot.owned_device_verified
+            && snapshot.locally_active
+            && player
+                .as_ref()
+                .is_some_and(|player| player.has_local_dsp() && player.observed_playing())
+        {
+            if let Some(track) = &snapshot.track {
+                pending_playback.note(&PlayerEvent::Playing {
+                    uri: track.uri.clone(),
+                    position_ms: snapshot
+                        .observed_position
+                        .unwrap_or(snapshot.position)
+                        .at(now_ms(), track.duration_ms)
+                        .min(u64::from(u32::MAX)) as u32,
+                });
+            }
+        }
         if Instant::now() >= next_maintenance && !maintaining.swap(true, Ordering::AcqRel) {
             next_maintenance = Instant::now() + Duration::from_secs(30);
             maintain_api(shared.clone(), maintaining.clone());
@@ -600,8 +885,8 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
         {
             let pcm = player
                 .as_ref()
-                .and_then(RuntimePlayer::audio_stats)
-                .is_some_and(|stats| stats.processed_frames > 0);
+                .and_then(|player| player.audio_stats())
+                .is_some_and(|stats| stats.processed_frames > pcm_baseline);
             if pcm {
                 shared.update(|snapshot| {
                     pending_playback.confirm(snapshot, true);
@@ -644,6 +929,7 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
         snapshot.locally_active = false;
         snapshot.soloist_ready = false;
         snapshot.owned_device_verified = false;
+        snapshot.control_pending = false;
     });
     media.update(&shared.snapshot());
     Ok(())
@@ -886,10 +1172,43 @@ fn media_command(event: MediaControlEvent, snapshot: &Snapshot) -> Option<Player
     })
 }
 
+fn audio_telemetry(
+    stats: soloist_runtime::pcm::AudioStats,
+) -> crate::domain::playback::AudioTelemetry {
+    crate::domain::playback::AudioTelemetry {
+        timing: Some(crate::domain::playback::AudioTimingTelemetry {
+            max_capture_gap_micros: stats.timing.max_capture_gap_micros,
+            max_write_gap_micros: stats.timing.max_write_gap_micros,
+            max_dispatch_micros: stats.timing.max_dispatch_micros,
+            max_transfer_micros: stats.timing.max_transfer_micros,
+            max_wait_micros: Some(stats.timing.max_wait_micros),
+            max_iteration_gap_micros: Some(stats.timing.max_iteration_gap_micros),
+            last_underflow_capture_gap_micros: stats.timing.last_underflow_capture_gap_micros,
+            last_underflow_pending_frames: stats.timing.last_underflow_pending_frames,
+            last_underflow_write_credit_frames: stats.timing.last_underflow_write_credit_frames,
+            observed_underflows: stats.timing.observed_underflows,
+        }),
+        processed_frames: stats.processed_frames,
+        peak_pending_frames: stats.peak_pending_frames,
+        estimated_latency_micros: stats.estimated_latency_micros,
+        latency_valid: stats.latency_valid,
+        dropped_frames: stats.dropped_frames,
+        capture_hole_frames: Some(stats.capture_hole_frames),
+        playback_underflows: Some(stats.playback_underflows),
+        worker_wakes: stats.worker_wakes,
+        resets: stats.resets,
+        fft_frames: stats.fft_frames,
+        fft_compute_micros: stats.fft_compute_micros,
+        peak_fft_compute_micros: stats.peak_fft_compute_micros,
+        recovery_attempts: stats.recovery_attempts,
+        health: stats.health,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> Arc<Shared> {
+    pub(super) fn fixture() -> Arc<Shared> {
         let mut snapshot = Snapshot::starting("/unused/test/config".into(), "Device".into());
         snapshot.web_api_ready = true;
         snapshot.catalog_available = true;
@@ -907,11 +1226,16 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             api: Mutex::new(None),
             api_gate: Arc::new(api_gate::ApiGate::default()),
+            publisher: Mutex::new(None),
             device: Mutex::new(Some("owned".into())),
             subscriptions: Mutex::new(HashMap::new()),
             oauth: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             commands,
+            control: OnceLock::new(),
+            lifetime: OnceLock::new(),
+            native_queue: Mutex::new(queue::NativeQueue::default()),
+            observations: AtomicU64::new(0),
         })
     }
     #[test]
@@ -936,5 +1260,128 @@ mod tests {
         assert!(!owner.snapshot().web_api_ready);
         assert_eq!(owner.snapshot().readiness, ServiceState::Degraded);
         assert!(owner.snapshot().owned_device_verified);
+    }
+
+    #[test]
+    fn detached_worker_retains_the_actual_server_lock_until_its_last_shared_owner_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::in_directory(root.path().canonicalize().unwrap().join("owner"));
+        let shared = fixture();
+        let released = Arc::downgrade(&shared);
+        let handler: Arc<server::Handler> = Arc::new(|_| Ok(Payload::Accepted));
+        let server =
+            server::Server::bind(paths.clone(), "/test/config".into(), handler.clone()).unwrap();
+        shared
+            .lifetime
+            .set(server.publisher_lock().unwrap())
+            .unwrap();
+        let detached = shared.clone();
+        let (release, received) = flume::bounded::<()>(1);
+        let worker = std::thread::spawn(move || {
+            received.recv().unwrap();
+            drop(detached);
+        });
+        drop(shared);
+        drop(server);
+        assert!(
+            server::Server::bind(paths.clone(), "/test/config".into(), handler.clone()).is_err()
+        );
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(released.strong_count(), 0);
+        // Closing the last descriptor and observing an uncontended Darwin
+        // flock need not happen in the same scheduler tick. Still require real
+        // reacquisition within a deadline; never release another owner's lock.
+        let started = Instant::now();
+        let mut probes = 0;
+        loop {
+            match server::Server::bind(paths.clone(), "/test/config".into(), handler.clone()) {
+                Ok(_replacement) => {
+                    if probes > 0 {
+                        eprintln!(
+                            "Owner lock release observed after {probes} contention probes ({:?})",
+                            started.elapsed()
+                        );
+                    }
+                    break;
+                }
+                Err(error)
+                    if started.elapsed() < Duration::from_secs(2)
+                        && error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                        }) =>
+                {
+                    probes += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!(
+                    "server ownership was not released after the last worker exited: {error:#}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn typed_queue_pages_keep_uid_source_and_duplicates_without_growing_status() {
+        use crate::domain::{QueueEntry, QueueSnapshot, QueueSource};
+        let shared = fixture();
+        let entries: Vec<_> = (0..5107)
+            .map(|i| QueueEntry {
+                uid: format!("native-{i}"),
+                source: QueueSource::Queue,
+                uri: "spotify:episode:0123456789abcdefghijkl".into(),
+                title: None,
+            })
+            .collect();
+        let mut native = shared.native_queue.lock().unwrap();
+        native.observe(QueueSnapshot {
+            upcoming: entries.clone(),
+            previous: vec![],
+            complete_catalog_context: true,
+        });
+        let mut prefix = shared.snapshot();
+        native.prefix(&mut prefix);
+        drop(native);
+        shared.update(|s| *s = prefix);
+        let Payload::Snapshot(status) = shared.handle(Operation::Status).unwrap() else {
+            panic!("status")
+        };
+        assert_eq!(status.queue.upcoming.len(), 10);
+        assert_eq!(status.queue_upcoming_total, 5107);
+        assert!(!status.queue.complete_catalog_context);
+        let Payload::QueuePage(page) = shared
+            .handle(Operation::QueuePage {
+                revision: Some(status.queue_revision),
+                offset: 5090,
+                limit: 50,
+                previous: false,
+                metadata: false,
+            })
+            .unwrap()
+        else {
+            panic!("queue page")
+        };
+        assert_eq!(page.entries, entries[5090..]);
+        assert_eq!(page.session_id, status.session_id);
+        assert!(!page.complete_catalog_context);
+        assert!(serde_json::to_vec(&page).unwrap().len() < crate::ipc::protocol::MAX_FRAME);
+        shared
+            .native_queue
+            .lock()
+            .unwrap()
+            .observe(QueueSnapshot::default());
+        let error = shared
+            .handle(Operation::QueuePage {
+                revision: Some(page.revision),
+                offset: 0,
+                limit: 50,
+                previous: false,
+                metadata: false,
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::CollectionChanged);
     }
 }

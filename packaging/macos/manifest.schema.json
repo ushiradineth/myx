@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "myx immutable Mac runtime bundle v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "target", "elfuse", "nixpkgs", "runner", "sysroot", "library_manifest", "audio_tools", "audio_modules", "files"],
+  "properties": {
+    "schema": {"const": 1},
+    "target": {"const": "aarch64-apple-darwin"},
+    "elfuse": {"const": "ba455f45592cd12488519e207c44c32fa8e167df"},
+    "nixpkgs": {"const": "0954f7ee2f6bb3dc7d4e3d0d8bcb8fd4bde4cfc5"},
+    "runner": {"const": "runtime/bin/elfuse"},
+    "sysroot": {"const": "runtime/sysroot"},
+    "library_manifest": {"const": "runtime/arm-libraries.json"},
+    "audio_tools": {"const": "runtime/audio"},
+    "audio_modules": {"const": "runtime/audio/modules"},
+    "files": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 20000,
+      "propertyNames": {"$ref": "#/$defs/path"},
+      "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\:\\u0000-\\u001f\\u007f]+$"
+    }
+  }
+}

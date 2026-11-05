@@ -133,12 +133,16 @@ pub(crate) fn fetch_detail_with(
                 None,
             )?
             .iter()
-            .filter_map(track_row),
+            .enumerate()
+            .filter_map(|(position, track)| Some(track_row(track)?.at_source_position(position))),
         ),
         "playlist" => items.extend(
             playlist_contents(&mut fetch, id)?
                 .iter()
-                .filter_map(parse_playlist_track),
+                .enumerate()
+                .filter_map(|(position, entry)| {
+                    Some(parse_playlist_track(entry)?.at_source_position(position))
+                }),
         ),
         _ => return Err(ApiError::InvalidRequest),
     }

@@ -1,5 +1,5 @@
 // Adapted from tools/soloist-elfuse under the project's MIT license.
-use crate::{platform, private, process};
+use crate::{executable, platform, private, process};
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU16, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub fn validate_sdk(path: &Path, expected: Option<&str>) -> Result<()> {
     let bytes = private::read_regular(path, None, 64 * 1024 * 1024)?;
-    validate_elf(&bytes)?;
+    executable::validate(&bytes, executable::Target::LinuxAarch64)?;
     if let Some(hash) = expected {
         ensure!(
             hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -27,34 +27,6 @@ pub fn validate_sdk(path: &Path, expected: Option<&str>) -> Result<()> {
             "SDK SHA256 does not match provisioned digest"
         );
     }
-    Ok(())
-}
-
-fn validate_elf(bytes: &[u8]) -> Result<()> {
-    ensure!(
-        bytes.len() >= 64 && &bytes[..7] == b"\x7fELF\x02\x01\x01",
-        "SDK must be an ELF64 little-endian executable"
-    );
-    let kind = u16::from_le_bytes(bytes[16..18].try_into()?);
-    let machine = u16::from_le_bytes(bytes[18..20].try_into()?);
-    let version = u32::from_le_bytes(bytes[20..24].try_into()?);
-    let offset = u64::from_le_bytes(bytes[32..40].try_into()?);
-    let header_size = u16::from_le_bytes(bytes[52..54].try_into()?);
-    let entry_size = u16::from_le_bytes(bytes[54..56].try_into()?);
-    let count = u16::from_le_bytes(bytes[56..58].try_into()?);
-    ensure!(
-        matches!(kind, 2 | 3)
-            && machine == 183
-            && version == 1
-            && header_size == 64
-            && entry_size == 56
-            && count != 0
-            && offset >= 64
-            && offset
-                .checked_add(u64::from(count) * 56)
-                .is_some_and(|end| end <= bytes.len() as u64),
-        "SDK must be a bounded AArch64 executable with valid ELF program headers"
-    );
     Ok(())
 }
 
@@ -129,10 +101,82 @@ pub struct Drain {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+pub(crate) struct Diagnostics {
+    get_info: AtomicU64,
+    add_user: AtomicU64,
+    flags: AtomicU32,
+}
+impl Diagnostics {
+    pub fn snapshot(&self) -> crate::SdkDiagnostics {
+        crate::SdkDiagnostics {
+            get_info_requests: self.get_info.load(Ordering::Relaxed),
+            add_user_requests: self.add_user.load(Ordering::Relaxed),
+            failure_flags: self.flags.load(Ordering::Relaxed),
+        }
+    }
+    fn note(&self, line: &[u8]) {
+        // Match fixed program phrases without allocating/copying a lowercased
+        // raw line. Never retain a payload, username, credential or broker route.
+        let has = |text: &[u8]| {
+            line.windows(text.len())
+                .any(|part| part.eq_ignore_ascii_case(text))
+        };
+        let increment = |counter: &AtomicU64| {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            });
+        };
+        if has(b"zeroconf: received getInfo") {
+            increment(&self.get_info);
+        }
+        if has(b"zeroconf: received addUser") {
+            increment(&self.add_user);
+        }
+        let mut flags = 0;
+        if has(b"login failed") || has(b"zeroconf_login_failed") {
+            flags |= 1;
+        }
+        if has(b"could not resolve")
+            || has(b"connection failed")
+            || has(b"connection timed out")
+            || has(b"network is unreachable")
+        {
+            flags |= 2;
+        }
+        if has(b"certificate verify failed")
+            || has(b"tls handshake failed")
+            || has(b"ssl certificate problem")
+        {
+            flags |= 4;
+        }
+        if has(b"make sure --api-key is valid")
+            || has(b"invalid api key")
+            || has(b"api key rejected")
+        {
+            flags |= 8;
+        }
+        if has(b"client expired, please update to a newer version") {
+            flags |= 16;
+        }
+        if has(b"zeroconf_bad_request")
+            || has(b"zeroconf_spotify_error")
+            || has(b"zeroconf_other_spotify_error")
+            || has(b"hmac verification failed")
+        {
+            flags |= 32;
+        }
+        if flags != 0 {
+            self.flags.fetch_or(flags, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Drain {
     pub fn start(
         mut pipe: impl Read + AsRawFd + Send + 'static,
         port: Arc<AtomicU16>,
+        diagnostics: Arc<Diagnostics>,
     ) -> Result<Self> {
         let fd = pipe.as_raw_fd();
         // SAFETY: the owned pipe's descriptor remains valid for both calls.
@@ -158,10 +202,12 @@ impl Drain {
                             for &byte in &buffer[..count] {
                                 if byte == b'\n' {
                                     if !overflow {
+                                        diagnostics.note(&line);
                                         if let Some(value) = pairing_port(&line) {
                                             port.store(value, Ordering::Relaxed);
                                         }
                                     }
+                                    line.fill(0);
                                     line.clear();
                                     overflow = false;
                                 } else if line.len() < 8192 && !overflow {
@@ -170,6 +216,7 @@ impl Drain {
                                     overflow = true;
                                 }
                             }
+                            buffer[..count].fill(0);
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -273,24 +320,11 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
-    fn elf() -> Vec<u8> {
-        let mut bytes = vec![0; 120];
-        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
-        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
-        bytes[18..20].copy_from_slice(&183u16.to_le_bytes());
-        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
-        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
-        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
-        bytes
-    }
-
     #[test]
     fn sdk_checks_architecture_bounds_digest_and_symlink() {
         let temp = tempfile::tempdir().unwrap();
         let sdk = temp.path().join("sdk");
-        let bytes = elf();
+        let bytes = executable::tests::elf();
         std::fs::write(&sdk, &bytes).unwrap();
         let hash = format!("{:x}", Sha256::digest(&bytes));
         assert!(validate_sdk(&sdk, Some(&hash)).is_ok());
@@ -299,10 +333,13 @@ mod tests {
         for offset in [0, 4, 5, 6, 16, 18, 20, 32, 52, 54, 56] {
             let mut wrong = bytes.clone();
             wrong[offset] = 255;
-            assert!(validate_elf(&wrong).is_err(), "offset {offset}");
+            assert!(
+                executable::validate(&wrong, executable::Target::LinuxAarch64).is_err(),
+                "offset {offset}"
+            );
         }
-        assert!(validate_elf(&bytes[..119]).is_err());
-        assert!(validate_elf(&bytes[..6]).is_err());
+        assert!(executable::validate(&bytes[..119], executable::Target::LinuxAarch64).is_err());
+        assert!(executable::validate(&bytes[..6], executable::Target::LinuxAarch64).is_err());
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&sdk, &alias).unwrap();
         assert!(validate_sdk(&alias, None).is_err());
@@ -378,7 +415,8 @@ mod tests {
     fn drain_is_bounded_and_can_stop_while_writer_remains_open() {
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let port = Arc::new(AtomicU16::new(0));
-        let mut drain = Drain::start(reader, port.clone()).unwrap();
+        let diagnostics = Arc::new(Diagnostics::default());
+        let mut drain = Drain::start(reader, port.clone(), diagnostics.clone()).unwrap();
         writer.write_all(b"private account payload\n").unwrap();
         writer.write_all(&vec![b'x'; 9000]).unwrap();
         writer
@@ -394,5 +432,24 @@ mod tests {
         assert_eq!(port.load(Ordering::Relaxed), 12345);
         drain.stop().unwrap();
         drain.stop().unwrap();
+    }
+
+    #[test]
+    fn auth_diagnostics_keep_only_fixed_categories_and_request_counts() {
+        let diagnostics = Diagnostics::default();
+        diagnostics.note(b"zeroconf: received getInfo PRIVATE-USERNAME");
+        diagnostics.note(b"zeroconf: received addUser PRIVATE-LOGIN-BLOB");
+        diagnostics.note(b"login failed: make sure --api-key is valid PRIVATE-KEY");
+        diagnostics.note(b"certificate verify failed PRIVATE-TOKEN");
+        let state = diagnostics.snapshot();
+        assert_eq!(state.get_info_requests, 1);
+        assert_eq!(state.add_user_requests, 1);
+        assert_eq!(state.failure_flags, 1 | 4 | 8);
+        let text = state.safe_message();
+        assert!(text.contains("api_key_validity_hint") && text.contains("tls_failure"));
+        assert!(!text.contains("PRIVATE"));
+        let clean = Diagnostics::default();
+        clean.note(b"username=PRIVATE credential=PRIVATE arbitrary error");
+        assert_eq!(clean.snapshot(), crate::SdkDiagnostics::default());
     }
 }

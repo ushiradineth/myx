@@ -25,18 +25,13 @@ pub fn dispatch(
         "Required services or owned-device verification need setup"
     );
     match command {
-        PlayerCommand::PlayContext {
-            uri,
-            track,
-            position_ms,
-            shuffle,
-        } => player.play_context_at(uri, track, position_ms, shuffle)?,
-        PlayerCommand::PlayTracks {
-            uris,
-            start,
-            position_ms,
-            shuffle,
-        } => player.play_tracks(uris, start, position_ms, shuffle)?,
+        // Loads must be planned and executed by the owner before dispatch. Never
+        // fall through to SDK tail-list/context-offset compatibility emulation.
+        PlayerCommand::PlayContext { .. }
+        | PlayerCommand::PlayTracks { .. }
+        | PlayerCommand::PlayContextAt { .. }
+        | PlayerCommand::PlayTracksAt { .. }
+        | PlayerCommand::PlayLiked { .. } => anyhow::bail!("Load requires owner intent execution"),
         PlayerCommand::Play => player.play()?,
         PlayerCommand::Pause => player.pause()?,
         PlayerCommand::Toggle => player.toggle()?,
@@ -79,22 +74,119 @@ pub fn restored_command(last: Option<PlayerCommand>, snapshot: &Snapshot) -> Pla
     let position_ms = snapshot.position.position_ms.min(u64::from(u32::MAX)) as u32;
     let track = snapshot.track.as_ref().map(|track| track.uri.clone());
     match last {
+        Some(PlayerCommand::PlayContextAt {
+            uri,
+            track: previous,
+            row_position,
+            ..
+        }) => {
+            if track.is_none() || track == previous {
+                PlayerCommand::PlayContextAt {
+                    uri,
+                    track: track.or(previous),
+                    row_position,
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                }
+            } else {
+                // An observed URI change does not reveal its original row index.
+                PlayerCommand::PlayContext {
+                    uri,
+                    track,
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                }
+            }
+        }
+        Some(PlayerCommand::PlayTracksAt {
+            uris, start_index, ..
+        }) => {
+            if track
+                .as_ref()
+                .is_none_or(|track| uris.get(start_index as usize) == Some(track))
+            {
+                PlayerCommand::PlayTracksAt {
+                    uris,
+                    start_index,
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                }
+            } else if track.as_ref().is_some_and(|track| !uris.contains(track)) {
+                PlayerCommand::PlayContext {
+                    uri: track.unwrap(),
+                    track: None,
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                }
+            } else {
+                PlayerCommand::PlayTracks {
+                    uris,
+                    start: track,
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                }
+            }
+        }
+        Some(PlayerCommand::PlayLiked {
+            start,
+            source_position,
+            ..
+        }) => {
+            let source_position = if track.is_none() || track == start {
+                source_position
+            } else {
+                None
+            };
+            PlayerCommand::PlayLiked {
+                start: track.or(start),
+                source_position,
+                position_ms,
+                shuffle: snapshot.shuffle,
+            }
+        }
         Some(PlayerCommand::PlayContext {
             uri,
             track: previous,
             ..
-        }) => PlayerCommand::PlayContext {
-            uri,
-            track: track.or(previous),
-            position_ms,
-            shuffle: snapshot.shuffle,
-        },
-        Some(PlayerCommand::PlayTracks { uris, start, .. }) => PlayerCommand::PlayTracks {
-            start: track.filter(|uri| uris.contains(uri)).or(start),
-            uris,
-            position_ms,
-            shuffle: snapshot.shuffle,
-        },
+        }) => {
+            match track {
+                // Direct playables and artist contexts cannot take a selected-track offset.
+                Some(observed)
+                    if super::intents::valid_uri(&uri, &["track", "episode", "artist"]) =>
+                {
+                    PlayerCommand::PlayContext {
+                        uri: observed,
+                        track: None,
+                        position_ms,
+                        shuffle: snapshot.shuffle,
+                    }
+                }
+                track => PlayerCommand::PlayContext {
+                    uri,
+                    track: track.or(previous),
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                },
+            }
+        }
+        Some(PlayerCommand::PlayTracks { uris, start, .. }) => {
+            if track.as_ref().is_some_and(|track| !uris.contains(track)) {
+                // Playback advanced outside the saved source. Do not reload its old start.
+                PlayerCommand::PlayContext {
+                    uri: track.unwrap(),
+                    track: None,
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                }
+            } else {
+                PlayerCommand::PlayTracks {
+                    start: track.or(start),
+                    uris,
+                    position_ms,
+                    shuffle: snapshot.shuffle,
+                }
+            }
+        }
         _ => track.map_or(PlayerCommand::Play, |uri| PlayerCommand::PlayContext {
             uri,
             track: None,

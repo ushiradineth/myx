@@ -88,6 +88,8 @@ pub(crate) struct LibItem {
     pub(crate) uri: String,
     pub(crate) kind: ItemKind,
     pub(crate) order: u32, // original fetch position (for the "Added" sort)
+    /// Original API row, independent of UI headers, filtering, and sort order.
+    pub(crate) source_position: Option<u32>,
 }
 
 impl LibItem {
@@ -98,6 +100,7 @@ impl LibItem {
             uri,
             kind: ItemKind::Track,
             order: 0,
+            source_position: None,
         }
     }
     pub(crate) fn ctx(name: String, subtitle: String, uri: String) -> Self {
@@ -107,6 +110,7 @@ impl LibItem {
             uri,
             kind: ItemKind::Context,
             order: 0,
+            source_position: None,
         }
     }
     pub(crate) fn play(name: String, uri: String) -> Self {
@@ -116,6 +120,7 @@ impl LibItem {
             uri,
             kind: ItemKind::Play,
             order: 0,
+            source_position: None,
         }
     }
     pub(crate) fn header(name: &str) -> Self {
@@ -125,7 +130,14 @@ impl LibItem {
             uri: String::new(),
             kind: ItemKind::Header,
             order: 0,
+            source_position: None,
         }
+    }
+
+    /// Attach collection coordinates before UI filtering and sorting.
+    pub(crate) fn at_source_position(mut self, position: usize) -> Self {
+        self.source_position = u32::try_from(position).ok();
+        self
     }
 
     /// Convenience: is this row a playable track?

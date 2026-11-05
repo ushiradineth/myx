@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "myx bundle-relative Linux ABI library paths v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "arch", "loader", "libraryPath"],
+  "properties": {
+    "schema": {"const": 1},
+    "arch": {"const": "aarch64-linux"},
+    "loader": {"const": "runtime/sysroot/lib/ld-linux-aarch64.so.1"},
+    "libraryPath": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^runtime/sysroot/(?:lib|nix/store/[^/:\\\\]+/lib(?:/[^/:\\\\]+)*)$"}
+    }
+  }
+}

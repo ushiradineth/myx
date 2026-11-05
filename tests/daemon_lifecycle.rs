@@ -135,3 +135,61 @@ fn an_oversized_mutation_reply_is_uncertain_not_a_safe_to_retry_failure() {
         Ok(_) => panic!("an oversized reply cannot certify the write outcome"),
     }
 }
+
+#[test]
+fn a_slow_paged_queue_reader_does_not_block_another_status_attach() {
+    use myx::domain::{QueueEntry, QueueSource};
+    use myx::ipc::protocol::QueuePage;
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::in_directory(root.path().canonicalize().unwrap().join("owner"));
+    let snapshot = Snapshot::starting("/test/config".into(), "Device".into());
+    let entries: Vec<_> = (0..50)
+        .map(|index| QueueEntry {
+            uid: format!("occurrence-{index}"),
+            source: QueueSource::Context,
+            uri: "spotify:track:0123456789abcdefghijkl".into(),
+            title: Some("x".repeat(4096)),
+        })
+        .collect();
+    let (entered, received) = flume::bounded(1);
+    let handler = Arc::new(move |operation| match operation {
+        Operation::QueuePage { .. } => {
+            entered.send(()).unwrap();
+            Ok(Payload::QueuePage(QueuePage {
+                session_id: snapshot.session_id.clone(),
+                auth_revision: 0,
+                revision: 7,
+                offset: 5106,
+                total: 100_000,
+                previous: false,
+                entries: entries.clone(),
+                complete_catalog_context: false,
+            }))
+        }
+        _ => Ok(Payload::Snapshot(Box::new(snapshot.clone()))),
+    });
+    let _owner = Server::bind(paths.clone(), "/test/config".into(), handler).unwrap();
+    let mut slow = UnixStream::connect(&paths.socket).unwrap();
+    protocol::send(
+        &mut slow,
+        &Request {
+            protocol_version: VERSION,
+            request_id: 8,
+            config_path: Some("/test/config".into()),
+            operation: Operation::QueuePage {
+                revision: Some(7),
+                offset: 5106,
+                limit: 50,
+                previous: false,
+                metadata: false,
+            },
+        },
+    )
+    .unwrap();
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        request(&paths, VERSION, "/test/config").result,
+        Ok(Payload::Snapshot(_))
+    ));
+    drop(slow);
+}

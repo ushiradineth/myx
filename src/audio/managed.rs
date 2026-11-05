@@ -13,6 +13,7 @@ pub(crate) struct ManagedProcessor {
     spectrum: SpectrumAnalyzer,
     spectrum_enabled: Arc<AtomicBool>,
     scratch: [f64; BLOCK_SAMPLES],
+    spectrum_requested: bool,
 }
 impl ManagedProcessor {
     pub(crate) fn new(
@@ -29,6 +30,7 @@ impl ManagedProcessor {
             spectrum: SpectrumAnalyzer::new(bands, SAMPLE_RATE as f32),
             spectrum_enabled,
             scratch: [0.0; BLOCK_SAMPLES],
+            spectrum_requested: false,
         }
     }
 }
@@ -44,9 +46,10 @@ impl AudioProcessor for ManagedProcessor {
         }
         self.filters.process_interleaved(scratch);
         if self.spectrum_enabled.load(Ordering::Acquire) {
+            self.spectrum_requested = true;
             self.spectrum.process(scratch, &self.spectrum_enabled);
-        } else {
-            self.spectrum.reset();
+        } else if self.spectrum_requested {
+            self.spectrum_requested = !self.spectrum.reset();
         }
         for (out, input) in samples.iter_mut().zip(scratch.iter()) {
             *out = *input as f32;
@@ -54,7 +57,14 @@ impl AudioProcessor for ManagedProcessor {
     }
     fn reset(&mut self) {
         self.filters.reset_states();
-        self.spectrum.reset();
+        self.spectrum_requested = !self.spectrum.reset();
+    }
+    fn fft_metrics(&self) -> (u64, u64, u64) {
+        (
+            self.spectrum.fft_frames() as u64,
+            self.spectrum.fft_compute_micros(),
+            self.spectrum.peak_fft_compute_micros(),
+        )
     }
 }
 

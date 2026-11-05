@@ -43,6 +43,14 @@ fn duplicate_owned_id_is_ambiguous_and_missing_services_never_claim_playing() {
     let mut snapshot = Snapshot::starting("/config".into(), "Player".into());
     reducer::observe(
         &mut snapshot,
+        PlayerEvent::Authentication {
+            logged_in: true,
+            is_active: true,
+        },
+        false,
+    );
+    reducer::observe(
+        &mut snapshot,
         PlayerEvent::TrackChanged {
             uri: "spotify:track:pending".into(),
         },

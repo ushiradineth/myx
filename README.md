@@ -1,293 +1,113 @@
 # myx
 
-A lean, beautiful terminal Spotify player in Rust. Streams natively as a Spotify
-Connect device, with album-art-reactive theming, a live audio visualizer, a
-ten-band equalizer, and synced lyrics.
+A terminal Spotify client with a daemon that owns playback, authorization and
+media controls. An Apple Silicon macOS preview is available from
+[GitHub releases](https://github.com/ushiradineth/myx/releases);
+exhaustive Mac acceptance remains incomplete. Windows development has started,
+but there is no runnable Windows release yet.
 
-<p align="center"><video src="https://github.com/user-attachments/assets/90706ba9-4c48-43d0-ad16-17b95c95dc94" alt="myx recolors the whole interface to the album art" width="100%"></p>
+Download and extract the complete `myx-macos-aarch64` layout, then run `bin/myx`.
+Keep its sibling `runtime`, source and license materials together. The preview
+is ad-hoc signed, not Developer ID notarized. Intermittent/startup underrun
+telemetry remains an open issue despite sampled no-audible-glitch feedback;
+actual terminal/media/account/login-service qualification is incomplete.
 
-<p align="center">
-  <img src="https://github.com/HaseebKhalid1507/Myx/releases/download/readme-assets/myx.png" width="49%">
-  <img src="https://github.com/user-attachments/assets/48dfec67-edd1-4903-a18d-8ed6d06ee5f9" width="49%">
-  <img src="https://github.com/user-attachments/assets/dd3844ad-f0c7-41ec-a934-86bb0e3ef75b" width="49%">
-  <img src="https://github.com/user-attachments/assets/08b3f505-5e48-4cd8-9b8d-0788d37f30c2" width="49%">
-</p>
+For declarative installation and age-backed credentials, see [Nix setup](docs/nix.md).
 
-> Requires **Spotify Premium**. Works on Linux, macOS, and Windows. Album art is
-> crispest on kitty, WezTerm, or foot.
+## macOS setup
 
-This fork also has an opt-in **Soloist** playback backend. Build the local Myx
-binary with `cargo build --release --features soloist`, then select it with
-`./target/release/myx --api soloist`. See [Playback backends](#production-playback-backends)
-for provisioning and capabilities. The normal backend remains the default.
+The delivery target is Apple Silicon on macOS 15 or newer. One `bin/myx`
+executable serves the TUI, bounded headless client and daemon. The daemon requires
+both Spotify Web API authorization and the Soloist runtime, including the
+processed PCM/EQ route. There is no backend feature flag or decoder fallback.
 
-## Install
+Soloist's vendor SDK and API key are user-provisioned. Neither belongs in a public
+archive, Nix input, issue report or source checkout. Spotify Premium is required
+for playback. You can prepare configuration before obtaining SDK/account assets;
+setup does not require Windows fixtures or start playback.
 
-```bash
-# Arch (AUR)
-yay -S myx
+1. Obtain a `myx-macos-aarch64` preview layout or follow the
+   [release assembly guide](docs/macos-release.md). Keep the whole layout together
+   in a stable user-owned location outside a Cargo checkout or Nix store.
+2. Explicitly initialize and edit a private configuration:
 
-# macOS / Linux (Homebrew)
-brew install HaseebKhalid1507/homebrew-tap/myx
+   ```sh
+   /absolute/install/myx-macos-aarch64/bin/myx config init --output /absolute/private/config.toml
+   /absolute/install/myx-macos-aarch64/bin/myx --config /absolute/private/config.toml config check
+   ```
 
-# Cargo (all platforms — Linux, macOS, Windows)
-cargo install myx
+   Use an existing owned private parent, or let init create missing directories
+   with mode 0700. The file is mode 0600; existing files are never overwritten.
+   See [configuration](docs/configuration.md) for SDK/key paths and migration.
+3. Set a Spotify application `client_id` in the private file. Register
+   `http://127.0.0.1:8989/login` in the
+   [Spotify developer dashboard](https://developer.spotify.com/dashboard).
+   Start `myx --config /absolute/private/config.toml` interactively when ready
+   to authorize. Authorization is explicit client work; a background daemon does
+   not open a browser. `--non-interactive` keeps clients from opening one too.
 
-# Prebuilt binary (Linux x86_64, macOS)
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HaseebKhalid1507/Myx/releases/latest/download/myx-installer.sh | sh
+Configuration load never creates or migrates a file. Missing credentials are a
+setup state, not evidence that playback is ready. Older upstream installers and
+package-manager releases are not installers for this rewrite.
+
+## Use
+
+```sh
+myx --config /absolute/private/config.toml
+myx daemon start --config /absolute/private/config.toml
+myx daemon status --config /absolute/private/config.toml --json
+myx --headless --duration 30 --non-interactive --config /absolute/private/config.toml
+myx daemon stop --config /absolute/private/config.toml
 ```
 
-On **Windows**, install [Rust](https://rustup.rs) first, then `cargo install myx` in
-PowerShell. Set `MYX_CLIENT_ID` as an environment variable or place your client ID in
-`%USERPROFILE%\.config\myx\client_id`.
+Track, album, playlist, artist and episode Spotify URIs and HTTPS share URLs are
+accepted. Headless runs require a duration from 1 to 86400 seconds. Closing the
+TUI detaches the client; use `daemon stop` to stop its owner. See
+[daemon and LaunchAgent](docs/daemon.md) for explicit service management.
 
-Or grab a `.deb` / archive from [Releases](https://github.com/HaseebKhalid1507/Myx/releases),
-or build from source: `cargo install --path .`.
+| Key | Action |
+| --- | --- |
+| Tab / `[` / `]` | Switch section |
+| Arrows / `j` / `k` | Navigate |
+| Enter | Play or open |
+| Shift+Enter / `P` | Play highlighted source |
+| `/` / `a` | Search / actions |
+| Space / `n` / `b` | Pause or play / next / previous |
+| Shift+Left / Shift+Right | Seek |
+| `s` / `R` | Shuffle / repeat |
+| `+` / `-` / `e` | Volume / equalizer |
+| `T` / `z` | Transparent background / sidebar |
+| `q` | Detach TUI |
 
-## Get started
+Album art, reactive colors, lyrics and a post-EQ spectrum belong to the client
+view. The daemon processes PCM even without a TUI or spectrum subscriber. Terminal
+image quality depends on the terminal protocol. System media controls and audio
+device recovery require owner acceptance on the final Mac build.
 
-For the normal backend and Web API browsing, you need a free Spotify app client ID:
+Optional local JSON output is documented in [now playing](docs/now-playing.md).
+The [platform scope](docs/platforms.md) distinguishes the local Mac release from
+in-progress Windows work and deferred ports.
 
-1. [Spotify developer dashboard](https://developer.spotify.com/dashboard), then **Create app**
-2. Add the redirect URI `http://127.0.0.1:8989/login`
-3. Copy the **Client ID** and set it:
+## Develop
 
-```bash
-export MYX_CLIENT_ID=<your-client-id>
+Use the pinned Nix shell on an Apple Silicon Mac:
+
+```sh
+nix develop -c cargo fmt --all -- --check
+nix develop -c cargo clippy --locked --workspace --all-targets -- -D warnings
+nix develop -c cargo test --locked --workspace --all-targets
 ```
 
-Then run:
+Software gates do not authorize or replace SDK/account, native audio, media-key,
+GUI or LaunchAgent acceptance. The Mac assembler never publishes; the legacy
+tag-triggered publishing workflow has been removed. There are no `soloist` build
+features, `--api`, `--backend`, MXC
+CLI mode or compiled librespot playback engine in this application.
 
-```bash
-myx
-```
+## Provenance and licenses
 
-First launch opens your browser to log in (OAuth PKCE, no secret needed). Then
-browse with `↑↓` and hit `⏎` to play. After that, just `myx`.
-
-## Keys
-
-```
-⇥ / [ ]    switch section        ← →      switch view
-↑↓ / j k   move                  ⏎        play / open
-⇧ ⏎        play the highlighted album, playlist or artist
-/          search                a        actions
-space      play · pause          n / b    next · prev
-⇧ ← →      seek                  s        shuffle
-+ / -      volume                R        repeat
-o          sort                  r        reload
-z          hide sidebar          e        equalizer
-q          quit                  T        transparent background
-```
-
-Media keys (Play/Pause, Stop, Next, Prev, Volume) work when the terminal is
-focused. On macOS and Linux, AirPods and headphone controls work from anywhere
-via the system's Now Playing integration. Mouse works too: click tabs, click a
-track, double-click to play.
-
-## Transparent background
-
-myx can leave the background to your terminal, so its own colour, opacity and
-blur show through while the text, accents and borders keep following the album
-art. The selected row and popups stay on a solid fill so they still read.
-
-- **Press `T`** (Shift+t) to flip between the transparent and the album-tinted
-  background. The choice is saved to `~/.config/myx/config.toml`, so it sticks.
-- **Or set it by hand**: `transparent = true` or `false` in the same file.
-
-New installs start transparent. A config written by an older myx has no
-`transparent` line and keeps the album-tinted background until you press `T`.
-How see-through it gets is up to the terminal — WezTerm's
-`window_background_opacity`, kitty's `background_opacity`, and so on.
-
-## Equalizer
-
-Press `e` for the live ten-band equalizer. Choose Flat, Bass Boost, Rock, Jazz,
-Vocal, Electronic or Treble Boost with `Tab` / `Shift+Tab`; changing a band
-creates a Custom curve. Use `←`/`→` to choose a band, `↑`/`↓` to adjust it,
-`Space` to compare against bypass, and `Esc` to close. Presets and sliders are
-also clickable and draggable. Automatic headroom keeps boosted curves from
-digitally clipping, and the complete curve is restored on the next launch.
-
-Holding `⇧ ←` / `⇧ →` scrubs continuously and commits one seek when you let go.
-`⇧ ⏎` needs a terminal that reports modified Enter (kitty, WezTerm, foot); `P`
-does the same everywhere.
-
-The album-art protocol is detected at startup and picked per terminal, including
-inside tmux. If your tmux has no sixel support, add `set -g focus-events on` to
-`~/.tmux.conf` so the art is re-sent when you switch back to myx's window.
-
-## Config
-
-`~/.config/myx/config.toml` is written on first run with every key but
-`transparent` commented out, so there is a file to edit and nothing to look up:
-
-```toml
-# Rows kept visible above and below the cursor before the list scrolls.
-scrolloff = 3
-
-# Show the locally saved track, source and position when Myx starts, paused
-# until you press play.
-restore_on_startup = true
-
-# Spotify app client id. MYX_CLIENT_ID overrides this if it is set.
-client_id = "your-client-id"
-
-# kitty, iterm2, sixel or halfblocks. Leave it out to auto-detect; set it if
-# album art comes out as a coarse mosaic, which means the terminal never
-# answered the detection query. MYX_PROTOCOL overrides this.
-protocol = "kitty"
-
-# Streaming quality in kbps: 96, 160 or 320. Any other whole number falls
-# back to 160.
-bitrate = 160
-
-# Even out loudness across tracks, the equivalent of the official client's
-# "Normalize volume". Leave it off to keep each track's own dynamics.
-normalize_volume = false
-
-# Leave the background to the terminal — its own colour, opacity and blur —
-# instead of the album-tinted one. Text and accents still follow the cover.
-# Press T in myx to flip it; this line is rewritten when you do.
-transparent = true
-```
-
-## Credits
-
-Streaming adapts pieces of [spotify-player](https://github.com/aome510/spotify-player)
-(MIT, © Thang Pham); visual language after [noodle](https://github.com/wilfredinni/noodle);
-built on [ratatui](https://ratatui.rs) and [librespot](https://github.com/librespot-org/librespot).
-See [NOTICE](NOTICE).
-
-## License
-
-MIT, see [LICENSE](LICENSE).
-
-## Production playback backends
-
-Myx defaults to the `normal` backend, with the existing librespot playback,
-equalizer, FFT visualizer and Mercury radio features. Build the optional Soloist
-backend into the same application with:
-
-```bash
-cargo build --release --features soloist
-target/release/myx --backend soloist
-```
-
-Set the default in `~/.config/myx/config.toml`:
-
-```toml
-backend = "normal" # or "soloist"; api is an alias for this config key
-
-[soloist]
-directory = "~/.config/myx/soloist" # optional; this is the default
-# api_key = "YOUR_SOLOIST_API_KEY" # inline alternative to api_key_file
-# api_key_file = "~/.config/myx/soloist/api-key" # default credential source
-# dsp = true # managed native EQ and spectrum; false explicitly bypasses the bridge
-# endpoint = "ws://127.0.0.1:12345" # attach to an externally managed SDK
-```
-
-Selection precedence is `--backend` / `--api`, then `MYX_BACKEND`, then the
-`backend` config key. For example, `target/release/myx --api soloist` overrides
-the environment and config. Backend selection is runtime configuration, including
-for future Windows backends; managed Soloist currently requires Apple Silicon
-and macOS 15 or newer. With `endpoint = "ws://127.0.0.1:PORT"` (replace `PORT`
-with the SDK's port), Myx attaches to that external process and never kills it.
-
-### Managed Soloist assets
-
-Keep the runtime outside the checkout, under `~/.config/myx/soloist` by default:
-
-```text
-soloist/
-  assets/soloist             # official ARM64 Linux SDK executable
-  assets/root/               # ARM64 Linux sysroot
-  assets/arm-libraries.json  # Nix library manifest
-  api-key                    # user-provisioned key, mode 0600
-  data/                      # paired session state, mode 0700
-  cache/                     # mode 0700
-  deps/elfuse/                # native runner store link
-  deps/audio/                 # native PulseAudio tools store link
-```
-
-Obtain the SDK and API key yourself through the
-[official Soloist documentation](https://developer.spotify.com/documentation/soloist).
-They are not redistributed here; the SDK's 90-day expiry still applies. Provision
-the executable and sysroot in `assets`, keep the key private, and set the data and
-cache directory permissions before launch. Paths can be overridden individually
-in `[soloist]`; use absolute paths or `~/` paths.
-
-To keep the key directly in Myx's config, set `[soloist].api_key` instead of
-`api_key_file`. Do not set both. An inline key does not require an `api-key` file;
-without either setting, Myx reads `api-key` from the Soloist directory. Keep
-`~/.config/myx/config.toml` private (`chmod 600`) when it contains a key, and never
-commit it. Key values are not included in Myx diagnostics. The SDK still requires
-the key in its process arguments, so do not share raw SDK process listings.
-
-For a fresh installation on a supported Mac, build the public dependencies from
-the repository root and register persistent store links:
-
-```bash
-soloist="$HOME/.config/myx/soloist"
-mkdir -p "$soloist/assets" "$soloist/deps" "$soloist/data" "$soloist/cache"
-chmod 700 "$soloist" "$soloist/data" "$soloist/cache"
-# After provisioning api-key from the official source:
-chmod 600 "$soloist/api-key"
-nix build --impure --builders '' -f ./nix/soloist.nix elfuse \
-  --out-link "$soloist/deps/elfuse"
-nix build --impure --builders '' -f ./nix/soloist.nix audio \
-  --out-link "$soloist/deps/audio"
-nix build --impure --builders '' -f ./nix/soloist.nix libraries \
-  --out-link "$soloist/assets/arm-libraries.json"
-```
-
-`nix/soloist.nix` exports `elfuse`, `audio`, `libraries` and optional `development`
-tools, pinned through the existing `flake.lock`. The immutable store name
-`myx-elfuse-packaging-trial` is retained for compatibility with the validated native
-derivation and existing GC roots; the production backend uses its patched runner.
-Existing migrated assets and registered roots can be reused without rebuilding.
-
-### Browsing, automation and limits
-
-Soloist URI playback does not need a Spotify Web API client ID. Myx does not
-prompt for one when Soloist is selected without `client_id`. Optional Web API
-browsing needs your own client ID and OAuth cache, as described above; use
-`--no-web-api` for URI-only playback. `--non-interactive` prevents an OAuth browser
-from opening.
-
-```bash
-target/release/myx --backend soloist --no-web-api \
-  spotify:track:4uLU6hMCjMI75M1A2tKUQC
-target/release/myx --backend soloist --no-web-api --non-interactive \
-  --headless --duration 30 spotify:track:4uLU6hMCjMI75M1A2tKUQC
-```
-
-For normal interactive use, keep Web API browsing enabled (the default):
-
-```bash
-target/release/myx --backend soloist
-```
-
-`--no-web-api` intentionally disables Home, Liked, playlists and search. It is an
-opt-out for URI-only playback, not the recommended interactive configuration.
-With existing Web API authorization, Soloist playback prefers the largest valid
-album image from the Web API and falls back to SDK artwork if unavailable.
-
-`--headless --duration SECONDS` runs the same playback engine for bounded track or
-episode automation, without a TUI. It confirms playback of the requested item,
-not merely a cached global playback state. Managed Soloist routes its private
-PulseAudio input through Myx's ten-band EQ and post-EQ FFT before CoreAudio output.
-Only Myx's audio is processed: this does not capture the microphone or system
-audio, install a virtual driver, or change the system default output. Streams use
-bounded stereo float32 PCM at 44.1 kHz. Pause/seek/stop flush queued PCM, and a
-bridge failure stops the owned runtime rather than silently bypassing EQ.
-`[soloist].dsp = false` explicitly restores direct output without EQ/spectrum.
-External WebSocket endpoints remain DSP-unavailable because Myx does not own
-their audio path. Native libpulse is loaded from the provisioned `deps/audio`;
-no global PulseAudio server is started or used. Headless managed playback reports
-processed-frame counts and estimated stream buffering, not acoustic latency.
-
-Soloist exposes native queue and metadata updates but not Mercury radio.
-Positioned context playback falls back to the selected
-track; the SDK cannot clear an existing queue, and list repeat is unsupported.
-These limits differ from the normal backend's playback behavior.
+This is a fork of [HaseebKhalid1507/Myx](https://github.com/HaseebKhalid1507/Myx).
+The project remains MIT-licensed; upstream credits and historical adaptations
+are retained in [NOTICE](NOTICE) and [LICENSE](LICENSE). The release includes
+separately licensed redistributable helpers and libraries. See
+[licensing](docs/licensing.md) before assembling or distributing them.

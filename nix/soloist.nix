@@ -12,7 +12,23 @@ let
     narHash = "sha256-twKqOFUr7+HWabxcOaAKdYIPkwm1AOIOVq2Ru6U4Dt0=";
   };
   packages = rec {
-    audioTools = native.pulseaudio;
+    audioTools = native.pulseaudio.overrideAttrs (old: {
+      patches = (old.patches or [ ]) ++ [
+        ./compat/pulseaudio-darwin-reset-priority.patch
+        ./compat/pulseaudio-json-utf8.patch
+      ];
+      doInstallCheck = true;
+      installCheckPhase = ''
+        runHook preInstallCheck
+        $CC ${./tests/pulse-priority.c} \
+          "$out/lib/pulseaudio/libpulsecommon-17.0.dylib" -o pulse-priority-test
+        ./pulse-priority-test
+        $CC ${./tests/pulse-json.c} \
+          "$out/lib/pulseaudio/libpulsecommon-17.0.dylib" -o pulse-json-test
+        ./pulse-json-test
+        runHook postInstallCheck
+      '';
+    });
     developmentTools = native.symlinkJoin {
       name = "myx-elfuse-development-tools";
       paths = [
@@ -63,6 +79,7 @@ let
         mkdir -p "$out/bin" "$out/share/licenses/elfuse"
         cp build/elfuse "$out/bin/elfuse"
         cp LICENSE "$out/share/licenses/elfuse/LICENSE"
+        if [ -f NOTICE ]; then cp NOTICE "$out/share/licenses/elfuse/NOTICE"; fi
         runHook postInstall
       '';
       postFixup = ''
@@ -132,4 +149,10 @@ in
   audio = packages.audioTools;
   libraries = packages.armLibraries;
   development = packages.developmentTools;
+  certificates = native.cacert;
+  # Metadata/tools for Mac delivery only, not a Linux application package.
+  releaseTools = native.symlinkJoin {
+    name = "myx-macos-release-tools";
+    paths = [ native.python3 native.patchelf ];
+  };
 }

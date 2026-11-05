@@ -12,6 +12,7 @@ pub(crate) fn handle_engine_event(
         liblog(format!("engine: {ev:?}"));
     }
     match ev {
+        EngineEvent::ProcessGroups(_) => {}
         EngineEvent::ReadModel(snapshot) => {
             let authority_changed = app.session.observe_authority(
                 &snapshot,
@@ -24,7 +25,18 @@ pub(crate) fn handle_engine_event(
             if authority_changed {
                 app.playback.seek_target = None;
             }
-            app.transport = Transport::from_snapshot(&snapshot);
+            let mut transport = Transport::from_snapshot(&snapshot);
+            if !authority_changed && app.transport.queue_revision == snapshot.queue_revision {
+                transport.queue_offset = app.transport.queue_offset;
+                transport.queue = std::mem::take(&mut app.transport.queue);
+                transport.queue_uris = std::mem::take(&mut app.transport.queue_uris);
+            } else if app.view.mode == RightView::Queue {
+                let _ = app
+                    .svc
+                    .engine
+                    .request_queue_page(Some(snapshot.queue_revision), 0);
+            }
+            app.transport = transport;
             app.playback
                 .apply_snapshot(&snapshot, myx::domain::playback::now_ms());
             if authority_changed {
@@ -56,8 +68,13 @@ pub(crate) fn handle_engine_event(
                     );
                 }
             }
-            if let Some(message) = snapshot.message {
-                app.status = message;
+            if let Some(message) = snapshot
+                .control_outcome
+                .as_ref()
+                .filter(|_| snapshot.control_pending || snapshot.control_error.is_some())
+                .or(snapshot.message.as_ref())
+            {
+                app.status = message.clone();
             }
         }
         EngineEvent::TrackChanged { uri } => {
@@ -97,7 +114,18 @@ pub(crate) fn handle_engine_event(
             }
             // Establish the model synchronously, before the following Playing
             // event. Cover HTTP must not lose the first playhead/paused update.
+            // Metadata/artwork supplements never replace the canonical clock.
             app.playback.apply_sdk_metadata(&meta);
+            if app
+                .transport
+                .canonical
+                .track
+                .as_ref()
+                .is_some_and(|track| track.uri == meta.uri)
+            {
+                app.playback
+                    .apply_snapshot(&app.transport.canonical, myx::domain::playback::now_ms());
+            }
             request_artwork(app, meta, meta_tx);
         }
         EngineEvent::QueueChanged { entries } => {
@@ -174,6 +202,17 @@ pub(crate) fn handle_engine_event(
             }
         }
         EngineEvent::EndOfTrack { .. } => {}
+        EngineEvent::NativeQueue(_)
+        | EngineEvent::Options { .. }
+        | EngineEvent::Volume { .. }
+        | EngineEvent::Context { .. }
+        | EngineEvent::PositionAnchor { .. }
+        | EngineEvent::AvailableActions { .. }
+        | EngineEvent::Buffering { .. }
+        | EngineEvent::LocallyInactive => {
+            // SDK observations are reduced by the daemon. Only ReadModel is
+            // authoritative here; inactive/buffering must never synthesize Stop.
+        }
     }
 }
 
@@ -214,8 +253,8 @@ fn queue_display<'a>(
             if title.is_empty() || title == uri {
                 if let Some(known) = names.get(uri.as_str()) {
                     title = (*known).to_owned();
-                } else if title.is_empty() {
-                    title.clone_from(&uri);
+                } else {
+                    title = "Loading metadata…".into();
                 }
             }
             (title, uri)
@@ -362,7 +401,7 @@ mod queue_tests {
                 "Playlist title",
                 "Search title",
                 "Playlist title",
-                "spotify:track:d"
+                "Loading metadata…"
             ]
         );
         assert_eq!(

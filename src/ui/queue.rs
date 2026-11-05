@@ -40,7 +40,21 @@ pub(crate) fn render_queue_view(f: &mut Frame, app: &App, theme: Theme, area: Re
         lines.push(Line::raw(""));
     }
 
-    lines.push(Line::from(Span::styled("UP NEXT", theme.heading())));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "UP NEXT  {}–{} / {} native entries  ·  PgUp/PgDn",
+            app.transport
+                .queue_offset
+                .saturating_add(1)
+                .min(app.transport.queue_total),
+            app.transport
+                .queue_offset
+                .saturating_add(app.transport.queue.len())
+                .min(app.transport.queue_total),
+            app.transport.queue_total
+        ),
+        theme.heading(),
+    )));
     lines.push(Line::raw(""));
 
     let used = lines.len();
@@ -55,7 +69,10 @@ pub(crate) fn render_queue_view(f: &mut Frame, app: &App, theme: Theme, area: Re
             .enumerate()
         {
             lines.push(Line::from(vec![
-                Span::styled(format!("{:>2}  ", i + 1), theme.muted()),
+                Span::styled(
+                    format!("{:>2}  ", app.transport.queue_offset + i + 1),
+                    theme.muted(),
+                ),
                 Span::styled(
                     truncate(q, max.saturating_sub(4)),
                     Style::default().fg(theme.text.into()),

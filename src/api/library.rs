@@ -126,7 +126,11 @@ pub(crate) fn fetch_section_with(
         Section::Liked => {
             let tracks: Vec<_> = collect(&format!("{API}/me/tracks?limit=50"), None)?
                 .iter()
-                .filter_map(|entry| track_row(&entry["track"]))
+                .enumerate()
+                .filter_map(|(position, entry)| {
+                    let track = myx::player::intents::liked_track(entry)?;
+                    Some(track_row(track)?.at_source_position(position))
+                })
                 .collect();
             if tracks.is_empty() {
                 Vec::new()

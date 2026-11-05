@@ -192,7 +192,7 @@ impl Connection {
                 return Ok(snapshot);
             }
             ensure!(snapshot.readiness != ServiceState::Error,
-                "Daemon setup failed; check client_id, Soloist key and SDK setup, then explicitly restart");
+                "Daemon services failed; inspect `myx daemon status`, then explicitly restart after resolving the reported failure");
             if !snapshot.web_api_ready
                 && !authorized
                 && snapshot.readiness == ServiceState::SetupRequired
@@ -226,10 +226,10 @@ impl Connection {
                 && snapshot.web_api_ready
                 && !snapshot.soloist_ready
             {
-                bail!("Soloist setup required; configure the API key and SDK, then explicitly restart the daemon");
+                bail!("Soloist runtime is unavailable; inspect `myx daemon status`, then run `myx daemon restart` to retry. Existing SDK and credentials may already be configured");
             }
             ensure!(Instant::now() < deadline,
-                "Daemon readiness timed out; check Web API authorization, client_id, Soloist key and SDK setup");
+                "Daemon readiness timed out; inspect `myx daemon status` before changing configuration");
             thread::sleep(Duration::from_millis(200));
         }
     }
@@ -252,6 +252,29 @@ impl Connection {
         )? {
             Payload::Json(value) => Ok(value),
             _ => bail!("Invalid daemon catalog response"),
+        }
+    }
+
+    pub fn queue_page(
+        &self,
+        revision: Option<u64>,
+        offset: usize,
+        limit: u8,
+        previous: bool,
+        metadata: bool,
+    ) -> Result<crate::ipc::protocol::QueuePage> {
+        match self.request(
+            Operation::QueuePage {
+                revision,
+                offset,
+                limit,
+                previous,
+                metadata,
+            },
+            CATALOG_TIMEOUT,
+        )? {
+            Payload::QueuePage(page) => Ok(page),
+            _ => bail!("Invalid daemon queue response"),
         }
     }
 
@@ -279,11 +302,22 @@ impl Connection {
             config_path: filter_config.then(|| self.config.to_str().unwrap_or_default().to_owned()),
             operation,
         };
-        let mut stream = DeadlineStream { stream, deadline };
+        let mut stream = DeadlineStream::new(stream, deadline)
+            .map_err(|_| anyhow::anyhow!("Cannot configure bounded daemon I/O"))?;
         protocol::send(&mut stream, &request)
             .map_err(|_| anyhow::anyhow!("Daemon request could not be sent within its deadline"))?;
-        let response: Response = protocol::receive(&mut stream).map_err(|_| {
-            anyhow::anyhow!("Daemon response is malformed, disconnected or timed out")
+        let response: Response = protocol::receive(&mut stream).map_err(|error| {
+            let message = match error.kind() {
+                io::ErrorKind::InvalidData => "Daemon response contains invalid IPC data",
+                io::ErrorKind::UnexpectedEof => {
+                    "Daemon disconnected before completing its response"
+                }
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                    "Daemon response deadline expired"
+                }
+                _ => "Daemon response could not be read",
+            };
+            anyhow::Error::new(error).context(message)
         })?;
         validate_response(response, request.request_id, request.config_path.as_deref())
     }
@@ -476,18 +510,88 @@ struct DeadlineStream {
     stream: UnixStream,
     deadline: Instant,
 }
+impl DeadlineStream {
+    fn new(stream: UnixStream, deadline: Instant) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        Ok(Self { stream, deadline })
+    }
+
+    fn ready(&self, events: libc::c_short) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        loop {
+            let millis = remaining(self.deadline)?
+                .as_millis()
+                .clamp(1, i32::MAX as u128) as i32;
+            let mut descriptor = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC deadline exceeded",
+                ));
+            }
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            // HUP can accompany a complete buffered response. Drain it before
+            // interpreting EOF; Darwin rejects SO_RCVTIMEO changes after close.
+            if descriptor.revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(());
+            }
+        }
+    }
+}
 impl Read for DeadlineStream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.stream
-            .set_read_timeout(Some(remaining(self.deadline)?))?;
-        self.stream.read(bytes)
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.ready(libc::POLLIN)?;
+            match self.stream.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                result => return result,
+            }
+        }
     }
 }
 impl Write for DeadlineStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream
-            .set_write_timeout(Some(remaining(self.deadline)?))?;
-        self.stream.write(bytes)
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.ready(libc::POLLOUT)?;
+            match self.stream.write(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                result => return result,
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -539,6 +643,65 @@ impl Drop for DetachedChild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_reply_is_readable_after_the_server_closes_its_socket() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let response = Response {
+            protocol_version: VERSION,
+            request_id: 1,
+            result: Ok(Payload::Snapshot(Box::new(Snapshot::starting(
+                "/test/config".into(),
+                "myx".into(),
+            )))),
+        };
+        protocol::send(&mut server, &response).unwrap();
+        drop(server);
+        let mut reader =
+            DeadlineStream::new(client, Instant::now() + Duration::from_secs(1)).unwrap();
+        protocol::receive::<Response>(&mut reader)
+            .expect("a buffered complete reply must survive peer close");
+    }
+
+    #[test]
+    fn fragmented_reply_does_not_reset_the_absolute_deadline() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            for byte in [1u8, 2, 3, 4] {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let mut reader =
+            DeadlineStream::new(client, Instant::now() + Duration::from_millis(70)).unwrap();
+        let error = reader
+            .read_exact(&mut [0; 4])
+            .expect_err("slow chunks must not extend the deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(reader);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_client_decodes_status_from_a_real_private_server() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::in_directory(root.path().canonicalize().unwrap().join("ipc"));
+        let config = PathBuf::from("/test/config");
+        let snapshot = Snapshot::starting(config.to_string_lossy().into_owned(), "myx".into());
+        let _server = crate::daemon::server::Server::bind(
+            paths.clone(),
+            config.to_string_lossy().into_owned(),
+            std::sync::Arc::new(move |_| Ok(Payload::Snapshot(Box::new(snapshot.clone())))),
+        )
+        .unwrap();
+        let connection = Connection { paths, config };
+        connection
+            .status_any_until(Instant::now() + Duration::from_secs(2))
+            .expect("real status response must decode")
+            .expect("owner must answer");
+    }
 
     #[test]
     fn sanitized_errors_keep_classification_and_bounded_retry_information() {

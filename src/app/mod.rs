@@ -124,25 +124,14 @@ impl App {
         if item.is_play() {
             // Special synthetic rows: play the Liked list (optionally shuffled).
             if item.uri == "myx:action:liked-play" {
-                let uris: Vec<String> = self
-                    .browse
-                    .library
-                    .liked
-                    .iter()
-                    .filter(|i| i.is_track())
-                    .map(|i| i.uri.clone())
-                    .collect();
-                if !uris.is_empty() {
-                    self.transport.source_name = "Liked Songs".to_string();
-                    self.status = "starting Liked Songs…".to_string();
-                    // Honour the current shuffle toggle instead of a dedicated row.
-                    if let Err(e) =
-                        self.svc
-                            .engine
-                            .play_tracks(uris, None, 0, self.transport.shuffle)
-                    {
-                        self.status = format!("couldn't play: {e:#}");
-                    }
+                self.transport.source_name = "Liked Songs".to_string();
+                self.status = "starting Liked Songs…".to_string();
+                if let Err(e) = self
+                    .svc
+                    .engine
+                    .play_liked(None, None, 0, self.transport.shuffle)
+                {
+                    self.status = format!("couldn't play: {e:#}");
                 }
                 return Activated::None;
             }
@@ -168,34 +157,55 @@ impl App {
                 let ctx = d.context_uri.clone();
                 self.transport.source_name = d.title.clone();
                 self.status = format!("starting {}…", item.name);
-                if let Err(e) = self.svc.engine.play_context_at(
-                    ctx,
-                    Some(item.uri.clone()),
-                    0,
-                    self.transport.shuffle,
-                ) {
+                let result = if let Some(position) = item.source_position {
+                    self.svc.engine.play_context_at_position(
+                        ctx,
+                        Some(item.uri.clone()),
+                        position,
+                        0,
+                        self.transport.shuffle,
+                    )
+                } else {
+                    // Artist Popular rows are direct playables, not album/playlist offsets.
+                    self.svc.engine.play_track_at(item.uri.clone(), 0)
+                };
+                if let Err(e) = result {
                     self.status = format!("couldn't play: {e:#}");
                 }
                 return Activated::None;
             }
             // Section track list.
-            let uris = self
-                .cur_items()
-                .iter()
-                .filter(|i| i.is_track())
-                .map(|i| i.uri.clone())
-                .collect();
             self.status = format!("starting {}…", item.name);
-            if self.browse.section == Section::Liked {
+            let result = if self.browse.section == Section::Liked {
                 self.transport.source_name = "Liked Songs".to_string();
+                self.svc.engine.play_liked(
+                    Some(item.uri.clone()),
+                    item.source_position,
+                    0,
+                    self.transport.shuffle,
+                )
             } else {
                 self.transport.source_name = self.browse.section.label().to_string();
-            }
-            if let Err(e) =
-                self.svc
-                    .engine
-                    .play_tracks(uris, Some(item.uri.clone()), 0, self.transport.shuffle)
-            {
+                let start_index = self.cur_items()[..self.browse.selected]
+                    .iter()
+                    .filter(|row| row.is_track())
+                    .count();
+                let uris = self
+                    .cur_items()
+                    .iter()
+                    .filter(|row| row.is_track())
+                    .map(|row| row.uri.clone())
+                    .collect();
+                match u32::try_from(start_index) {
+                    Ok(index) => {
+                        self.svc
+                            .engine
+                            .play_tracks_at_index(uris, index, 0, self.transport.shuffle)
+                    }
+                    Err(_) => Err(anyhow::anyhow!("Selection index exceeds playback bounds")),
+                }
+            };
+            if let Err(e) = result {
                 self.status = format!("couldn't play: {e:#}");
             }
             return Activated::None;

@@ -34,6 +34,9 @@ pub struct Server {
 }
 
 impl Server {
+    pub(crate) fn publisher_lock(&self) -> Result<File> {
+        Ok(self._lock.try_clone()?)
+    }
     pub fn bind(paths: RuntimePaths, config: String, handler: Arc<Handler>) -> Result<Self> {
         paths.prepare()?;
         let lock = open_private_lock(&paths.daemon_lock)?;

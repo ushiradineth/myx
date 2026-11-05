@@ -72,6 +72,37 @@ impl SoloistConfig {
             self.initial_volume <= 100,
             "soloist.initial_volume must be from 0 to 100"
         );
+        for path in [
+            &self.directory,
+            &self.sdk,
+            &self.runner,
+            &self.sysroot,
+            &self.library_manifest,
+            &self.audio_tools,
+            &self.api_key_file,
+            &self.data_dir,
+            &self.cache_dir,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            absolute_soloist_path(path)?;
+        }
+        if let Some(paths) = &self.library_path {
+            ensure!(
+                !paths.is_empty()
+                    && paths
+                        .split(':')
+                        .all(|p| p.starts_with('/') && !p.chars().any(char::is_control)),
+                "Soloist library_path must contain absolute nonempty paths"
+            );
+        }
+        if let Some(hash) = &self.expected_sdk_sha256 {
+            ensure!(
+                hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                "Soloist SDK checksum must contain 64 hexadecimal digits"
+            );
+        }
         Ok(())
     }
 
@@ -233,7 +264,7 @@ transparent = true
 #sdk = \"/absolute/path/to/sdk\"
 #runner = \"/absolute/path/to/runner\"
 #sysroot = \"/absolute/path/to/sysroot\"
-#library_manifest = \"/absolute/path/to/libraries.toml\"
+#library_manifest = \"/absolute/path/to/arm-libraries.json\"
 #library_path = \"/absolute/path/to/libraries\"
 #audio_tools = \"/absolute/path/to/audio-tools\"
 # Choose only one credential source. Never share the completed file.
@@ -495,6 +526,44 @@ pub fn migration_candidate(text: &str) -> Result<String> {
     Ok(candidate)
 }
 
+/// Explicit setup only. Never consult the shared read-once configuration, launch
+/// services, inspect credentials/SDKs, or include source text in diagnostics.
+pub fn setup(
+    command: crate::cli::ConfigCommand,
+    source: &Path,
+    output: Option<&Path>,
+) -> Result<()> {
+    use crate::cli::ConfigCommand;
+    match command {
+        ConfigCommand::Check => {
+            let text = private_file::read(source)
+                .map_err(|_| anyhow::anyhow!(UNSAFE))?
+                .ok_or_else(|| anyhow::anyhow!("configuration is missing; use config init"))?;
+            Config::parse(&text)?;
+        }
+        ConfigCommand::Init => {
+            private_file::create(output.unwrap_or(source), template()).map_err(|_| {
+                anyhow::anyhow!(
+                    "cannot create new private configuration; destination must not exist"
+                )
+            })?;
+        }
+        ConfigCommand::Migrate => {
+            let output = output.ok_or_else(|| anyhow::anyhow!("migration requires --output"))?;
+            let text = private_file::read(source)
+                .map_err(|_| anyhow::anyhow!(UNSAFE))?
+                .ok_or_else(|| anyhow::anyhow!("migration source is missing"))?;
+            let candidate = migration_candidate(&text)?;
+            private_file::create(output, &candidate).map_err(|_| {
+                anyhow::anyhow!(
+                    "cannot create private migration candidate; destination must not exist"
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn set_key(text: &str, key: &str, value: &str) -> Result<String> {
     let mut expected = document(text)?;
     let replacement: toml::Table =
@@ -656,6 +725,60 @@ mod private_file {
         Ok(read_at(&dir, &name)?.map(|(text, _)| text))
     }
 
+    pub(super) fn create(path: &Path, text: &str) -> io::Result<()> {
+        if text.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(safe_io());
+        }
+        let (dir, name) = parent(path, true)?;
+        // Publish only a fully written candidate. linkat is no-replace, including
+        // concurrent creators and symlinks; no rename can overwrite live config.
+        static NEXT_CREATE: AtomicU64 = AtomicU64::new(0);
+        let temp = CString::new(format!(
+            ".myx-candidate-{}-{}",
+            std::process::id(),
+            NEXT_CREATE.fetch_add(1, Ordering::Relaxed)
+        ))
+        .map_err(|_| safe_io())?;
+        // SAFETY: exclusive relative creation through the verified parent fd.
+        let mut file = opened(unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                temp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        })?;
+        let result = (|| {
+            // SAFETY: only the newly owned candidate descriptor is modified.
+            if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
+                return Err(safe_io());
+            }
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            // SAFETY: both names are relative to our live directory descriptor.
+            if unsafe {
+                libc::linkat(
+                    dir.as_raw_fd(),
+                    temp.as_ptr(),
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    0,
+                )
+            } < 0
+            {
+                return Err(safe_io());
+            }
+            dir.sync_all()
+        })();
+        // SAFETY: unlink only our exclusive temporary name, never the destination.
+        let cleanup = unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) };
+        result?;
+        if cleanup < 0 {
+            return Err(safe_io());
+        }
+        dir.sync_all()
+    }
+
     pub(super) fn update(
         path: &Path,
         edit: impl FnOnce(&str) -> io::Result<String>,
@@ -723,6 +846,9 @@ mod private_file {
 mod private_file {
     use super::*;
     pub(super) fn read(_: &Path) -> io::Result<Option<String>> {
+        Err(safe_io())
+    }
+    pub(super) fn create(_: &Path, _: &str) -> io::Result<()> {
         Err(safe_io())
     }
     pub(super) fn update(_: &Path, _: impl FnOnce(&str) -> io::Result<String>) -> io::Result<()> {

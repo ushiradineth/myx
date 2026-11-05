@@ -96,7 +96,7 @@ impl ShutdownSignals {
 fn main() -> Result<()> {
     let cli = Cli::parse_from(std::env::args())?;
     if cli.help {
-        println!("myx [OPTIONS] [SPOTIFY_URI_OR_URL]\n  daemon run|start|stop|restart|status\n  service install|uninstall|status\n  --config PATH          Select configuration\n  --non-interactive      Never open browser authorization\n  --headless --duration SECONDS  Observe playback without a terminal\n  --volume 0..100        Set playback volume\n  --json                 Machine-readable management status\n  --help, --version");
+        println!("myx [OPTIONS] [SPOTIFY_URI_OR_URL]\n  daemon run|start|stop|restart|status\n  service install|uninstall|status\n  config init|check|migrate\n  --config PATH          Select configuration\n  --output PATH          New config candidate (required for migrate)\n  --non-interactive      Never open browser authorization\n  --headless --duration SECONDS  Observe playback without a terminal\n  --volume 0..100        Set playback volume\n  --json                 Machine-readable management status\n  --help, --version");
         return Ok(());
     }
     if cli.version {
@@ -169,7 +169,7 @@ async fn boot(terminal: &mut Term, startup: Startup, picker: Picker) -> Result<(
     let engine = Player::connect(startup.connection.clone(), ev_tx)?;
     let webapi = Arc::new(Mutex::new(WebApi::new(startup.connection)));
     let snapshot = startup.snapshot;
-    let mut app = App {
+    let app = App {
         svc: Services {
             engine,
             picker,
@@ -218,7 +218,6 @@ async fn boot(terminal: &mut Term, startup: Startup, picker: Picker) -> Result<(
     // Only explicit CLI intent writes controls. Attach never restores client state.
     if let Some(volume) = startup.volume {
         app.svc.engine.set_volume(vol_u16(volume))?;
-        app.transport.volume = volume;
     }
     if let Some(uri) = startup.uri {
         app.svc
@@ -364,6 +363,25 @@ async fn run_ui(
             biased;
             signal = shutdown.recv() => { signal?; break; },
             _ = frame.tick() => {
+                // Project the original daemon timestamp/speed on each frame.
+                // Supplemental UI work must not restart the canonical clock.
+                app.playback.apply_snapshot(&app.transport.canonical, myx::domain::playback::now_ms());
+                if let Some(result) = app.svc.engine.take_queue_page() {
+                    match result {
+                        Ok(page) if page.session_id == app.transport.canonical.session_id
+                            && page.auth_revision == app.transport.canonical.auth_revision
+                            && page.revision == app.transport.queue_revision
+                            && page.offset == app.transport.queue_offset => {
+                            app.transport.queue_total = page.total;
+                            app.transport.queue = page.entries.iter().map(|entry| entry.title.clone().unwrap_or_else(|| "Loading metadata…".into())).collect();
+                            app.transport.queue_uris = page.entries.into_iter().map(|entry| entry.uri).collect();
+                            app.status = "native queue page loaded (catalog completeness unknown)".into();
+                            dirty = true;
+                        }
+                        Ok(_) => {}
+                        Err(error) => { app.status = format!("queue page: {error}"); dirty = true; }
+                    }
+                }
                 request_library_section(&mut app, &chans, false);
                 if app.view.mode == RightView::Lyrics { request_lyrics(&mut app, &chans.lyrics); }
                 app.playback.flush_seek(&app.svc.engine, Instant::now());
@@ -428,7 +446,9 @@ async fn run_ui(
                 }
                 if last_sync.elapsed() >= SYNC_EVERY {
                     last_sync = Instant::now();
-                    if app.transport.playback_started { let _ = app.svc.engine.request_queue(); }
+                    if app.view.mode == RightView::Queue {
+                        let _ = app.svc.engine.request_queue_page(Some(app.transport.queue_revision), app.transport.queue_offset);
+                    }
                 }
                 false
             }

@@ -11,6 +11,14 @@ pub enum Mode {
     Tui,
     Daemon(DaemonCommand),
     Service(ServiceCommand),
+    Config(ConfigCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigCommand {
+    Init,
+    Check,
+    Migrate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +49,7 @@ pub struct Cli {
     pub version: bool,
     pub config: Option<PathBuf>,
     pub json: bool,
+    pub output: Option<PathBuf>,
 }
 
 impl Cli {
@@ -70,7 +79,7 @@ impl Cli {
                     "--backend" | "--api" | "--no-web-api" | "--theme" => {
                         bail!("removed mode or option; use --help for supported commands")
                     }
-                    "--duration" | "--volume" | "--config" => {
+                    "--duration" | "--volume" | "--config" | "--output" => {
                         let next;
                         let value = match inline {
                             Some(value) => value,
@@ -107,6 +116,10 @@ impl Cli {
                                     "volume must be an integer from 0 to 100",
                                 )? as u8);
                             }
+                            "--output" => {
+                                ensure!(cli.output.is_none(), "output specified more than once");
+                                cli.output = Some(PathBuf::from(value));
+                            }
                             _ => {
                                 ensure!(cli.config.is_none(), "config specified more than once");
                                 cli.config = Some(PathBuf::from(value));
@@ -138,15 +151,22 @@ impl Cli {
                     (Some("service"), "install") => Mode::Service(ServiceCommand::Install),
                     (Some("service"), "uninstall") => Mode::Service(ServiceCommand::Uninstall),
                     (Some("service"), "status") => Mode::Service(ServiceCommand::Status),
+                    (Some("config"), "init") => Mode::Config(ConfigCommand::Init),
+                    (Some("config"), "check") => Mode::Config(ConfigCommand::Check),
+                    (Some("config"), "migrate") => Mode::Config(ConfigCommand::Migrate),
                     _ => bail!("unknown management command; use --help for usage"),
                 };
                 command_seen = true;
-            } else if !positional_only && matches!(arg, "daemon" | "service") {
+            } else if !positional_only && matches!(arg, "daemon" | "service" | "config") {
                 ensure!(
                     command_group.is_none() && cli.uri.is_none(),
                     "unexpected command"
                 );
-                command_group = Some(if arg == "daemon" { "daemon" } else { "service" });
+                command_group = Some(match arg {
+                    "daemon" => "daemon",
+                    "service" => "service",
+                    _ => "config",
+                });
             } else {
                 ensure!(
                     command_group.is_none(),
@@ -166,6 +186,21 @@ impl Cli {
                 "playback options cannot be used with management commands"
             );
         }
+        ensure!(
+            cli.output.is_none()
+                || matches!(
+                    cli.mode,
+                    Mode::Config(ConfigCommand::Init | ConfigCommand::Migrate)
+                ),
+            "--output requires config init or config migrate"
+        );
+        ensure!(
+            cli.mode != Mode::Config(ConfigCommand::Migrate)
+                || cli.output.is_some()
+                || cli.help
+                || cli.version,
+            "config migrate requires an explicit new --output candidate"
+        );
         ensure!(
             !cli.json
                 || matches!(

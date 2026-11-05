@@ -20,7 +20,7 @@ pub fn fmt_ms(ms: u32) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-/// Convert a 0..=100 percentage to librespot's 0..=65535 volume range.
+/// Convert a 0..=100 percentage to the client's 0..=65535 volume range.
 pub fn vol_u16(pct: u8) -> u16 {
     (pct as u32 * 65535 / 100) as u16
 }

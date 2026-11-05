@@ -15,3 +15,10 @@ libloading = "0.8"
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
+
+[dev-dependencies]
+myx = { path = "../.." }
+
+[[test]]
+name = "native_audio"
+path = "src/lib.rs"

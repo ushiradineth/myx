@@ -201,6 +201,52 @@ fn skips_null_entries() {
 }
 
 #[test]
+fn collection_rows_keep_original_positions_through_null_filtering_and_sorting() {
+    let result = crate::api::fetch_detail_with(
+        |path| {
+            if path.contains("fields=snapshot_id") {
+                Ok(json!({"snapshot_id":"same"}))
+            } else {
+                Ok(json!({"items":[
+                    {"item":{"name":"Z first","uri":"spotify:track:0123456789abcdefghijkl"}},
+                    {"item":null},
+                    {"item":{"name":"A duplicate","uri":"spotify:track:0123456789abcdefghijkl"}}
+                ],"next":null,"total":3}))
+            }
+        },
+        "spotify:playlist:0123456789abcdefghijkl",
+        "Source",
+    )
+    .unwrap();
+    let mut rows = result.items;
+    assert!(rows[0].is_play());
+    assert_eq!(rows[0].source_position, None);
+    assert_eq!(rows[1].source_position, Some(0));
+    assert_eq!(rows[2].source_position, Some(2));
+    sort_list(&mut rows, SortMode::Title);
+    assert_eq!(rows[1].name, "A duplicate");
+    assert_eq!(rows[1].source_position, Some(2));
+    assert_eq!(rows[2].source_position, Some(0));
+}
+
+#[test]
+fn album_rows_keep_original_positions_before_filtering() {
+    let result = crate::api::fetch_detail_with(
+        |_| {
+            Ok(json!({"items":[null,
+            {"name":"B","uri":"spotify:track:1123456789abcdefghijkl"},
+            {"name":"A","uri":"spotify:track:0123456789abcdefghijkl"}
+        ],"next":null,"total":3}))
+        },
+        "spotify:album:0123456789abcdefghijkl",
+        "Source",
+    )
+    .unwrap();
+    assert_eq!(result.items[1].source_position, Some(1));
+    assert_eq!(result.items[2].source_position, Some(2));
+}
+
+#[test]
 fn skips_entry_without_uri() {
     let it = json!({"item": {"name": "No URI", "artists": [{"name": "X"}]}});
     assert!(parse_playlist_track(&it).is_none());

@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::domain::{PlayerCommand, Snapshot};
 use crate::webapi::HttpMethod;
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const MAX_FRAME: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -30,6 +30,13 @@ pub enum Operation {
         client_id: String,
     },
     Player(PlayerCommand),
+    QueuePage {
+        revision: Option<u64>,
+        offset: usize,
+        limit: u8,
+        previous: bool,
+        metadata: bool,
+    },
     Catalog {
         method: HttpMethod,
         path: String,
@@ -50,9 +57,23 @@ pub struct Response {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Payload {
     Snapshot(Box<Snapshot>),
+    QueuePage(QueuePage),
     Accepted,
     Json(Value),
     Authorization { url: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuePage {
+    pub session_id: String,
+    pub auth_revision: u64,
+    pub revision: u64,
+    pub offset: usize,
+    pub total: usize,
+    pub previous: bool,
+    pub entries: Vec<crate::domain::queue::QueueEntry>,
+    /// Native availability only, never the size/completeness of a logical source.
+    pub complete_catalog_context: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +150,19 @@ pub fn receive<T: DeserializeOwned>(stream: &mut impl Read) -> io::Result<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn starting_snapshot_response_round_trips_through_the_actual_wire_format() {
+        let response = super::Response {
+            protocol_version: super::VERSION,
+            request_id: 1,
+            result: Ok(super::Payload::Snapshot(Box::new(
+                crate::domain::Snapshot::starting("/test/config".into(), "myx".into()),
+            ))),
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        serde_json::from_slice::<super::Response>(&bytes).expect("snapshot response must decode");
+    }
+
     use super::*;
     #[test]
     fn oversized_frame_is_refused_before_body_read() {

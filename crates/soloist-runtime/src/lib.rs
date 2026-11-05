@@ -6,10 +6,134 @@
 //! Drop performs the same cleanup on a best-effort basis. Failed startup performs
 //! cleanup before returning; group termination can take up to five seconds per
 //! child in addition to the readiness deadline.
+//! Recoverable processed-output loss keeps the private server, SDK and discovery
+//! alive. Polling `is_running` services bounded output recovery; inspect the
+//! supplied `pcm::AudioControl` separately for output readiness and health.
 
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Non-retaining SDK log summary. Only counts and fixed error categories escape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SdkDiagnostics {
+    pub get_info_requests: u64,
+    pub add_user_requests: u64,
+    pub failure_flags: u32,
+}
+impl SdkDiagnostics {
+    pub fn safe_message(self) -> String {
+        let categories = [
+            (1, "authentication_failed"),
+            (2, "network_failure"),
+            (4, "tls_failure"),
+            (8, "api_key_validity_hint"),
+            (16, "sdk_expired"),
+            (32, "pairing_rejected"),
+        ]
+        .into_iter()
+        .filter_map(|(bit, name)| (self.failure_flags & bit != 0).then_some(name))
+        .collect::<Vec<_>>();
+        format!(
+            "SDK pairing diagnostics: getInfo={}, addUser={}, categories={}",
+            self.get_info_requests,
+            self.add_user_requests,
+            if categories.is_empty() {
+                "none".into()
+            } else {
+                categories.join(",")
+            }
+        )
+    }
+}
+
+/// Safe startup context: never contains argv, credentials or vendor responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupStage {
+    Configuration,
+    SdkValidation,
+    Credential,
+    Storage,
+    NativeAudio,
+    SdkProcess,
+    SdkReadiness,
+    Transport,
+}
+
+impl std::fmt::Display for StartupStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Configuration => "Soloist runtime configuration is invalid or incomplete",
+            Self::SdkValidation => "Soloist SDK file validation failed; check the provisioned SDK",
+            Self::Credential => {
+                "Soloist API-key validation failed; check the configured credential source"
+            }
+            Self::Storage => "Soloist private data/cache setup or ownership lock failed",
+            Self::NativeAudio => "Soloist native PulseAudio/CoreAudio startup failed",
+            Self::SdkProcess => "Soloist SDK runner could not be started",
+            Self::SdkReadiness => "Soloist SDK did not reach owned endpoint/discovery readiness",
+            Self::Transport => "Soloist owned WebSocket transport failed",
+        })
+    }
+}
+impl std::error::Error for StartupStage {}
+
+/// Only known local messages/context are exposed, never an arbitrary error chain.
+pub fn startup_diagnostic(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        match cause.to_string().as_str() {
+            "owned native audio server exited" => return "Private PulseAudio exited during startup; check the relocated audio modules and libraries",
+            "private server has no unique verified CoreAudio sink" => return "Private audio startup found no unique verified CoreAudio output",
+            "native libpulse unavailable" => return "Private PCM bridge could not load the native libpulse library",
+            "native libpulse API unavailable" => return "Private PCM bridge could not load the required native libpulse symbols",
+            "owned runtime exited before readiness" => return "Soloist SDK or its owned audio process exited before endpoint readiness",
+            _ => {}
+        }
+    }
+    match error.downcast_ref::<StartupStage>() {
+        Some(StartupStage::Configuration) => {
+            "Soloist runtime configuration is invalid or incomplete"
+        }
+        Some(StartupStage::SdkValidation) => {
+            "Soloist SDK file validation failed; check the provisioned SDK"
+        }
+        Some(StartupStage::Credential) => {
+            "Soloist API-key validation failed; check the configured credential source"
+        }
+        Some(StartupStage::Storage) => "Soloist private data/cache setup or ownership lock failed",
+        Some(StartupStage::NativeAudio) => "Soloist native PulseAudio/CoreAudio startup failed",
+        Some(StartupStage::SdkProcess) => "Soloist SDK runner could not be started",
+        Some(StartupStage::SdkReadiness) => {
+            "Soloist SDK did not reach owned endpoint/discovery readiness"
+        }
+        Some(StartupStage::Transport) => "Soloist owned WebSocket transport failed",
+        None => "Soloist worker stopped after a runtime or transport failure",
+    }
+}
+
+#[cfg(test)]
+mod startup_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn nested_startup_context_is_actionable_without_forwarding_secret_details() {
+        let error = anyhow::anyhow!("PRIVATE-CREDENTIAL-AND-PROVIDER-DIAGNOSTIC")
+            .context(StartupStage::NativeAudio)
+            .context("owned startup failed");
+        assert_eq!(
+            startup_diagnostic(&error),
+            "Soloist native PulseAudio/CoreAudio startup failed"
+        );
+        assert_eq!(
+            startup_diagnostic(&anyhow::anyhow!("PRIVATE-CREDENTIAL")),
+            "Soloist worker stopped after a runtime or transport failure"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/native_audio.rs"]
+mod native_audio;
+
+pub mod executable;
 pub mod pcm;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod pulse;
@@ -37,6 +161,9 @@ pub struct Config {
     pub sysroot: PathBuf,
     pub library_path: String,
     pub audio_tools: PathBuf,
+    /// Optional owned bundle module directory; None keeps the tools' compiled
+    /// module search path. This is not a backend or DSP selector.
+    pub audio_modules: Option<PathBuf>,
     pub api_key: ApiKey,
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
@@ -58,6 +185,26 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub fn sdk_diagnostics(&self) -> SdkDiagnostics {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.managed.sdk_diagnostics()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            SdkDiagnostics::default()
+        }
+    }
+    pub fn process_groups(&self) -> Vec<(u32, u32)> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.managed.process_groups()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Vec::new()
+        }
+    }
     pub fn start(config: Config) -> Result<Self> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -69,8 +216,9 @@ impl Runtime {
             let _ = config;
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "managed Soloist runtime requires macOS ARM64; use an external WebSocket backend on this platform",
-            ).into())
+                "managed Soloist runtime requires macOS ARM64",
+            )
+            .into())
         }
     }
 
@@ -150,6 +298,7 @@ mod tests {
             sysroot: "absent".into(),
             library_path: String::new(),
             audio_tools: "absent".into(),
+            audio_modules: None,
             api_key: ApiKey::File("absent".into()),
             data_dir: "absent".into(),
             cache_dir: "absent".into(),

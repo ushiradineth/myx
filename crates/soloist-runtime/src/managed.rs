@@ -25,10 +25,42 @@ pub struct Managed {
     audio: Option<Audio>,
     scratch: Option<TempDir>,
     locks: Vec<SessionLock>,
+    diagnostics: Arc<sdk::Diagnostics>,
 }
 
 impl Managed {
+    pub fn sdk_diagnostics(&self) -> crate::SdkDiagnostics {
+        self.diagnostics.snapshot()
+    }
+    pub fn process_groups(&self) -> Vec<(u32, u32)> {
+        self.sdk
+            .as_ref()
+            .map(|sdk| sdk.child.id())
+            .into_iter()
+            .chain(self.audio.as_ref().map(|audio| audio.child.child.id()))
+            .filter_map(|pid| {
+                let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+                (group > 0).then_some((pid, group as u32))
+            })
+            .collect()
+    }
     pub fn start(
+        config: Config,
+        processing: Option<(
+            crate::pcm::AudioControl,
+            Box<dyn crate::pcm::AudioProcessor>,
+        )>,
+    ) -> Result<(Self, String)> {
+        Self::start_inner(config, processing).map_err(|error| {
+            if error.downcast_ref::<crate::StartupStage>().is_some() {
+                error
+            } else {
+                error.context(crate::StartupStage::SdkReadiness)
+            }
+        })
+    }
+
+    fn start_inner(
         mut config: Config,
         processing: Option<(
             crate::pcm::AudioControl,
@@ -36,11 +68,12 @@ impl Managed {
         )>,
     ) -> Result<(Self, String)> {
         let deadline = Instant::now() + Duration::from_secs(25);
-        validate_config(&config)?;
-        sdk::validate_sdk(&config.sdk, config.expected_sdk_sha256.as_deref())?;
-        let key = private::credential(&config.api_key)?;
-        private::directory(&config.data_dir)?;
-        private::directory(&config.cache_dir)?;
+        validate_config(&config).context(crate::StartupStage::Configuration)?;
+        sdk::validate_sdk(&config.sdk, config.expected_sdk_sha256.as_deref())
+            .context(crate::StartupStage::SdkValidation)?;
+        let key = private::credential(&config.api_key).context(crate::StartupStage::Credential)?;
+        private::directory(&config.data_dir).context(crate::StartupStage::Storage)?;
+        private::directory(&config.cache_dir).context(crate::StartupStage::Storage)?;
         config.data_dir = config.data_dir.canonicalize()?;
         config.cache_dir = config.cache_dir.canonicalize()?;
         let mut managed = Self {
@@ -51,12 +84,17 @@ impl Managed {
             audio: None,
             scratch: None,
             locks: Vec::new(),
+            diagnostics: Arc::new(sdk::Diagnostics::default()),
         };
         // Lock both persistent stores. Lock files are never unlinked: doing so
         // would let another runtime lock a different inode while this one runs.
-        managed.locks.push(SessionLock::acquire(&config.data_dir)?);
+        managed
+            .locks
+            .push(SessionLock::acquire(&config.data_dir).context(crate::StartupStage::Storage)?);
         if config.cache_dir != config.data_dir {
-            managed.locks.push(SessionLock::acquire(&config.cache_dir)?);
+            managed.locks.push(
+                SessionLock::acquire(&config.cache_dir).context(crate::StartupStage::Storage)?,
+            );
         }
         let scratch = tempfile::Builder::new()
             .prefix(".soloist-run-")
@@ -64,12 +102,16 @@ impl Managed {
         std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))?;
         private::directory(scratch.path())?;
         managed.scratch = Some(scratch);
-        managed.audio = Some(Audio::start(
-            managed.scratch.as_ref().unwrap().path(),
-            &config.audio_tools,
-            deadline,
-            processing,
-        )?);
+        managed.audio = Some(
+            Audio::start(
+                managed.scratch.as_ref().unwrap().path(),
+                &config.audio_tools,
+                config.audio_modules.as_deref(),
+                deadline,
+                processing,
+            )
+            .context(crate::StartupStage::NativeAudio)?,
+        );
         let audio = managed.audio.as_ref().unwrap();
         let mut command = Command::new(&config.runner);
         command
@@ -90,6 +132,8 @@ impl Managed {
             ),
             ("LANG", "C"),
             ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
+            // ELFUSE's IPv6 UDP resolver socket options fail; keep existing DNS servers over TCP.
+            ("RES_OPTIONS", "use-vc"),
         ] {
             command.args(["--env", &format!("{name}={value}")]);
         }
@@ -117,7 +161,8 @@ impl Managed {
             .stderr(Stdio::piped());
         process::remaining(deadline, Duration::from_secs(1))?;
         let started = SystemTime::now();
-        managed.sdk = Some(OwnedChild::spawn(&mut command)?);
+        managed.sdk =
+            Some(OwnedChild::spawn(&mut command).context(crate::StartupStage::SdkProcess)?);
         drop(command);
         drop(key);
         let child = &mut managed.sdk.as_mut().unwrap().child;
@@ -126,10 +171,12 @@ impl Managed {
         managed.drains.push(Drain::start(
             child.stdout.take().context("SDK stdout missing")?,
             port.clone(),
+            managed.diagnostics.clone(),
         )?);
         managed.drains.push(Drain::start(
             child.stderr.take().context("SDK stderr missing")?,
             port.clone(),
+            managed.diagnostics.clone(),
         )?);
         let mut control = None;
         let mut identity = None;
@@ -172,7 +219,7 @@ impl Managed {
         self.sdk
             .as_mut()
             .is_some_and(|sdk| matches!(sdk.child.try_wait(), Ok(None)))
-            && self.audio.as_ref().is_some_and(|audio| audio.running())
+            && self.audio.as_mut().is_some_and(|audio| audio.running())
             && self
                 .audio
                 .as_mut()
@@ -252,6 +299,7 @@ impl Drop for Managed {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
+    crate::audio::validate_modules_path(config.audio_modules.as_deref())?;
     ensure!(
         (1..=128).contains(&config.device_name.len())
             && !config.device_name.chars().any(char::is_control),
@@ -306,6 +354,7 @@ mod tests {
             sysroot: "/unprovisioned/root".into(),
             library_path: "/unprovisioned/lib".into(),
             audio_tools: "/unprovisioned/audio".into(),
+            audio_modules: None,
             api_key: crate::ApiKey::File("/unprovisioned/key".into()),
             data_dir: "/unprovisioned/data".into(),
             cache_dir: "/unprovisioned/cache".into(),
@@ -330,11 +379,14 @@ mod tests {
         }
         let mut invalid = config();
         invalid.initial_volume = 101;
-        assert!(crate::Runtime::start(invalid)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("volume"));
+        let error = crate::Runtime::start(invalid).err().unwrap();
+        assert!(error
+            .chain()
+            .any(|cause| cause.to_string().contains("volume")));
+        assert_eq!(
+            error.downcast_ref::<crate::StartupStage>(),
+            Some(&crate::StartupStage::Configuration)
+        );
         let mut invalid = config();
         invalid.sdk = "relative".into();
         assert!(validate_config(&invalid).is_err());
@@ -371,6 +423,7 @@ mod tests {
             audio: None,
             scratch: Some(scratch),
             locks: vec![lock],
+            diagnostics: Arc::new(sdk::Diagnostics::default()),
         };
         managed.shutdown().unwrap();
         assert!(managed.device_id().is_err());
@@ -401,6 +454,7 @@ mod tests {
                 audio: None,
                 scratch: Some(scratch),
                 locks: vec![SessionLock::acquire(&data).unwrap()],
+                diagnostics: Arc::new(sdk::Diagnostics::default()),
             },
         };
         assert!(SessionLock::acquire(&data).is_err());

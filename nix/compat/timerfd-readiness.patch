@@ -10,7 +10,7 @@ transactional restoration after a host allocation failure is not added here.
 
 --- a/src/syscall/fd.c
 +++ b/src/syscall/fd.c
-@@ -131,6 +131,18 @@
+@@ -131,22 +131,34 @@
      return sfd_alloc_slot(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]));
  }
 -
@@ -30,7 +30,16 @@ transactional restoration after a host allocation failure is not added here.
  /* Called with sfd_lock held. Drain any kevent expirations sitting on the
   * timer's kqueue and fold them into the slot's accumulator. Used by
   * timerfd_read before consuming the counter and by timerfd_fdinfo_snapshot
-@@ -147,7 +159,7 @@
+  * before reporting it; without this drain, fdinfo would lag the actual fire
+  * count by however many ticks were pending in the kqueue.
+  */
+ static void timerfd_drain_pending_locked(int slot)
+ {
+     int kq = timerfd_state[slot].kq_fd;
+     struct kevent kev;
+     struct timespec ts_zero = {0, 0};
+     int nev = kevent(kq, NULL, 0, &kev, 1, &ts_zero);
+     if (nev > 0) {
          uint64_t fires = (uint64_t) kev.data;
          if (fires == 0)
              fires = 1; /* At least one expiration */
@@ -38,8 +47,6 @@ transactional restoration after a host allocation failure is not added here.
 +        timerfd_note_expirations_locked(slot, fires);
      }
  }
--
-+
 @@ -320,22 +332,32 @@
          (long long) its.it_interval_sec, (long long) its.it_interval_nsec,
          (long long) value_us, (long long) interval_ns, interval_ns == 0);

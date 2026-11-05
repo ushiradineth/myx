@@ -1,0 +1,16 @@
+--- a/src/pulsecore/core-util.c
++++ b/src/pulsecore/core-util.c
+@@ -793,3 +793,13 @@ void pa_reset_priority(void) {
+     pa_zero(sp);
++#ifdef OS_IS_DARWIN
++    /* SCHED_OTHER priority zero is not the normal priority on Darwin.
++     * Restore the platform's default rather than starving the mainloop. */
++    {
++        pthread_attr_t defaults;
++        pa_assert_se(pthread_attr_init(&defaults) == 0);
++        pa_assert_se(pthread_attr_getschedparam(&defaults, &sp) == 0);
++        pa_assert_se(pthread_attr_destroy(&defaults) == 0);
++    }
++#endif
+     pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+ #endif

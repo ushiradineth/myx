@@ -8,7 +8,7 @@ spotify-player  (https://github.com/aome510/spotify-player)
     Copyright (c) 2021 Thang Pham — MIT License
     The following files are adapted from that project:
       * src/audio/visualizer.rs   — the real-time FFT visualization sink
-      * src/engine/auth.rs        — the OAuth 2.0 PKCE flow
+      * src/webapi/auth.rs        — the OAuth 2.0 PKCE flow (formerly src/engine/auth.rs)
     Additionally, the librespot streaming/Spirc wiring, the mercury-based radio
     lookup, and the "reclaim playback via device transfer" approach were learned
     by studying spotify-player's source.
@@ -19,4 +19,26 @@ noodle  (https://github.com/wilfredinni/noodle)
     OpenTUI aesthetic. No code is shared; the theme palettes were ported as data.
 
 librespot  (https://github.com/librespot-org/librespot)
-    The Spotify Connect streaming engine myx is built on. MIT License.
+    Historical streaming engine used by the upstream application. MIT License.
+    It is not the playback engine of this daemon/Soloist rewrite. Historical
+    attribution is retained for provenance, not as a current dependency claim.
+
+Mac runtime redistributables
+    ELFUSE (https://github.com/sysprog21/elfuse), pinned revision
+    ba455f45592cd12488519e207c44c32fa8e167df, Apache License 2.0.
+    Local futex-clock, timerfd-readiness and reproducible packaging adjustments
+    are in nix/compat. No vendor SDK is included or patched by packaging.
+    The temporary-path audit adjustment derives from Nixpkgs; its MIT notice
+    is retained in nix/compat/nixpkgs-LICENSE and release licenses/NIXPKGS-MIT.
+
+    PulseAudio, glibc, compiler runtime, CA certificates and recursive linked
+    dependencies retain their own licenses. Exact output/source/license records
+    and full texts are mandatory in each assembled archive's licenses directory.
+    This NOTICE is not a substitute for those texts, source availability or
+    relinking obligations. See docs/licensing.md.
+    Native PulseAudio Darwin default-priority reset and UTF-8 JSON patches are
+    in nix/compat.
+
+Soloist SDK
+    User-provisioned vendor software, excluded from public source/build inputs
+    and all public archives. This project's MIT license does not license it.

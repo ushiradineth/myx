@@ -8,12 +8,7 @@
   outputs =
     { self, nixpkgs }:
     let
-      supportedSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
-      ];
+      supportedSystems = [ "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
     in
     {
@@ -26,15 +21,24 @@
         rec {
           myx = pkgs.rustPlatform.buildRustPackage {
             pname = "myx";
-            version = "0.3.1";
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 
             src = lib.cleanSourceWith {
               src = ./.;
               filter = path: type:
+                let
+                  relative = lib.removePrefix (toString ./. + "/") (toString path);
+                  parts = lib.splitString "/" relative;
+                  top = builtins.head parts;
+                in
                 lib.cleanSourceFilter path type
+                && (toString path == toString ./. || builtins.elem top [
+                  "Cargo.toml" "Cargo.lock" "LICENSE" "NOTICE" "README.md"
+                  "src" "crates" "examples" "tests" "nix" "flake.lock" "packaging"
+                ])
                 && !lib.any
-                  (component: builtins.elem component [ ".runtime" ".cache" "target" "tools" ])
-                  (lib.splitString "/" (lib.removePrefix (toString ./. + "/") (toString path)));
+                  (component: builtins.elem component [ ".agents" ".runtime" ".cache" "__pycache__" "target" "tools" "result" "assets" "credentials" "api-key" ])
+                  parts;
             };
             cargoLock.lockFile = ./Cargo.lock;
 
@@ -87,6 +91,7 @@
               rust-analyzer
               rustc
               rustfmt
+              python3
             ];
           };
         }

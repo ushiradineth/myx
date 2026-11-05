@@ -79,6 +79,26 @@ pub(crate) fn handle_key(
     }
 
     match code {
+        KeyCode::PageDown | KeyCode::PageUp if app.view.mode == RightView::Queue => {
+            let offset = if code == KeyCode::PageDown {
+                app.transport
+                    .queue_offset
+                    .saturating_add(10)
+                    .min(app.transport.queue_total.saturating_sub(1) / 10 * 10)
+            } else {
+                app.transport.queue_offset.saturating_sub(10)
+            };
+            if let Err(error) = app
+                .svc
+                .engine
+                .request_queue_page(Some(app.transport.queue_revision), offset)
+            {
+                app.status = format!("queue page: {error}");
+            } else {
+                app.transport.queue_offset = offset;
+                app.status = "loading queue page…".into();
+            }
+        }
         KeyCode::Char('e') => {
             app.view.equalizer = Some(EqualizerOverlay::default());
         }
@@ -117,16 +137,19 @@ pub(crate) fn handle_key(
             let _ = app.svc.engine.prev();
         }
         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Media(MediaKeyCode::RaiseVolume) => {
-            app.transport.volume = (app.transport.volume + 5).min(100);
-            let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
+            let _ = app
+                .svc
+                .engine
+                .set_volume(vol_u16((app.transport.volume + 5).min(100)));
         }
         KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Media(MediaKeyCode::LowerVolume) => {
-            app.transport.volume = app.transport.volume.saturating_sub(5);
-            let _ = app.svc.engine.set_volume(vol_u16(app.transport.volume));
+            let _ = app
+                .svc
+                .engine
+                .set_volume(vol_u16(app.transport.volume.saturating_sub(5)));
         }
         KeyCode::Char('s') => {
-            app.transport.shuffle = !app.transport.shuffle;
-            let _ = app.svc.engine.shuffle(app.transport.shuffle);
+            let _ = app.svc.engine.shuffle(!app.transport.shuffle);
         }
         // Play the highlighted playlist / album / artist outright. Enter still
         // opens; this is the direct route that used to require two Enters or
@@ -134,17 +157,15 @@ pub(crate) fn handle_key(
         KeyCode::Char('P') => play_selected_context(app, false),
         KeyCode::Char('S') => {
             // Keep the visible toggle consistent with this explicit request.
-            app.transport.shuffle = true;
-            let _ = app.svc.engine.shuffle(true);
             play_selected_context(app, true);
         }
         KeyCode::Char('R') => {
-            app.transport.repeat = match app.transport.repeat {
+            let repeat = match app.transport.repeat {
                 RepeatMode::Off => RepeatMode::All,
                 RepeatMode::All => RepeatMode::One,
                 RepeatMode::One => RepeatMode::Off,
             };
-            let _ = app.svc.engine.set_repeat(app.transport.repeat);
+            let _ = app.svc.engine.set_repeat(repeat);
         }
         KeyCode::Char('r') => {
             if let Some(detail) = app.browse.details.last() {
@@ -259,7 +280,10 @@ pub(crate) fn handle_key(
 }
 
 fn request_visible_queue(app: &mut App, _chans: &UiChannels) {
-    if let Err(e) = app.svc.engine.request_queue() {
+    if let Err(e) = app.svc.engine.request_queue_page(
+        Some(app.transport.queue_revision),
+        app.transport.queue_offset,
+    ) {
         app.status = format!("queue refresh failed: {e}");
     }
 }

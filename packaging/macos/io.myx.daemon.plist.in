@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Definition example only. src/service/macos.rs renders the managed file. -->
+<plist version="1.0"><dict>
+<key>Label</key><string>io.myx.daemon</string>
+<key>ProgramArguments</key><array>
+<string>@EXECUTABLE_XML@</string><string>daemon</string><string>run</string>
+<string>--config</string><string>@CONFIG_XML@</string>
+</array>
+<key>EnvironmentVariables</key><dict><key>MYX_SUPERVISED</key><string>1</string></dict>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>ThrottleInterval</key><integer>30</integer>
+<key>StandardOutPath</key><string>@STDOUT_XML@</string>
+<key>StandardErrorPath</key><string>@STDERR_XML@</string>
+<key>Umask</key><integer>63</integer>
+</dict></plist>
