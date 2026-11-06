@@ -39,3 +39,42 @@ fn flipping_transparency_mid_fade_sticks_when_the_fade_lands() {
         .as_ref()
         .is_some_and(|f| f.current().transparent && f.target().transparent));
 }
+
+#[test]
+fn retargeting_a_palette_starts_from_the_displayed_colors_without_a_snap() {
+    let displayed = Theme::lerp(&TOKYONIGHT, &myx::theme::GRUVBOX, 0.4);
+    let mut state = ThemeState {
+        displayed,
+        target: myx::theme::GRUVBOX,
+        fade: Some(ThemeFade::new(
+            TOKYONIGHT,
+            myx::theme::GRUVBOX,
+            Duration::from_secs(10),
+        )),
+    };
+    state.start_fade(TOKYONIGHT);
+    assert_eq!(state.displayed.background, displayed.background);
+    assert_eq!(
+        state.fade.as_ref().unwrap().current().background,
+        displayed.background
+    );
+    assert_eq!(state.target.background, TOKYONIGHT.background);
+}
+
+#[test]
+fn a_finished_palette_fade_snaps_to_target_and_stops_requesting_animation() {
+    let target = Theme {
+        transparent: true,
+        ..myx::theme::GRUVBOX
+    };
+    let mut state = ThemeState {
+        displayed: TOKYONIGHT,
+        target,
+        fade: Some(ThemeFade::new(TOKYONIGHT, target, Duration::ZERO)),
+    };
+    state.advance();
+    assert!(state.fade.is_none());
+    assert_eq!(state.displayed.background, target.background);
+    assert_eq!(state.displayed.primary, target.primary);
+    assert!(state.displayed.transparent);
+}

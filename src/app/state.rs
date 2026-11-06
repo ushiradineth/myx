@@ -186,6 +186,9 @@ pub(crate) struct EqualizerOverlay {
 #[derive(Default)]
 pub(crate) struct SessionState {
     pub(crate) authority: Option<CatalogAuthority>,
+    // Outgoing pixels while the canonical track's artwork is being fetched.
+    // Kept separate from NowPlaying so they never become the new track's cover.
+    pub(crate) transition_cover: Option<Cover>,
     // Track URI whose metadata was last requested. Fetches run on separate
     // blocking tasks and can land out of order when skipping quickly, so a
     // reply for any other track is stale and must be dropped.

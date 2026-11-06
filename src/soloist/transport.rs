@@ -158,6 +158,15 @@ impl PlaybackGate {
         self.apply(&mut state);
     }
 
+    fn observe_playback(&self, playback: &Playback) {
+        // A granular track_changed event invalidates per-item Playing evidence,
+        // not the continuous SDK audio stream. Only explicit state or ownership
+        // changes may interrupt it; control writes already close the gate.
+        if !playback.active || !playback.status.is_empty() {
+            self.set_active(playback.active && playback.status == "playing");
+        }
+    }
+
     fn set_verified(&self, verified: bool, stopping: &AtomicBool) {
         let mut state = self
             .state
@@ -1522,9 +1531,7 @@ fn transport(
                                 // command_result is intentionally ignored by the
                                 // state reducer: acceptance is not playback.
                                 session.observe(&value, &mut peer, tx)?;
-                                audio.set_active(
-                                    session.playback.active && session.playback.status == "playing",
-                                );
+                                audio.observe_playback(&session.playback);
                             }
                         }
                     }
@@ -1925,6 +1932,76 @@ mod tests {
         assert_eq!(player.has_local_dsp(), dsp_ready);
         assert_eq!(player.phase.load(Ordering::Acquire), READY);
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn natural_track_metadata_preserves_pcm_without_confirming_the_next_item() {
+        let (player, _) = test_engine(READY);
+        player.set_verified(true);
+        let gate = &player.playback_gate;
+        let (tx, rx) = flume::unbounded();
+        let mut playback = Playback::default();
+        playback.update(
+            &json!({"type":"playback_state","is_active":true,"status":"playing","item":item(A)}),
+            &tx,
+        );
+        gate.observe_playback(&playback);
+        assert!(gate.state.lock().unwrap().applied_active);
+        while rx.try_recv().is_ok() {}
+
+        playback.update(&json!({"type":"track_changed","item":item(B)}), &tx);
+        gate.observe_playback(&playback);
+        assert!(
+            gate.state.lock().unwrap().applied_active,
+            "metadata alone must not flush continuous owned PCM"
+        );
+        assert!(!playback.playing(B), "metadata is not Playing confirmation");
+        assert!(!rx
+            .try_iter()
+            .any(|event| matches!(event, EngineEvent::Playing { .. })));
+
+        playback.update(
+            &json!({"type":"position_sync","position":{"position_ms":0}}),
+            &tx,
+        );
+        gate.observe_playback(&playback);
+        assert!(gate.state.lock().unwrap().applied_active);
+        playback.update(&json!({"type":"playback_changed","status":"playing"}), &tx);
+        gate.observe_playback(&playback);
+        assert!(playback.playing(B));
+        for status in ["buffering", "paused", "idle"] {
+            playback.update(&json!({"type":"playback_changed","status":status}), &tx);
+            gate.observe_playback(&playback);
+            assert!(!gate.state.lock().unwrap().applied_active);
+        }
+    }
+
+    #[test]
+    fn metadata_does_not_reopen_pcm_after_a_control_flush_or_ownership_loss() {
+        let (player, _) = test_engine(READY);
+        player.set_verified(true);
+        let gate = &player.playback_gate;
+        let (tx, _) = flume::unbounded();
+        let mut playback = Playback::default();
+        playback.update(
+            &json!({"type":"playback_state","is_active":true,"status":"playing","item":item(A)}),
+            &tx,
+        );
+        gate.observe_playback(&playback);
+        playback.status.clear();
+        gate.set_active(false);
+        playback.update(&json!({"type":"track_changed","item":item(B)}), &tx);
+        gate.observe_playback(&playback);
+        assert!(!gate.state.lock().unwrap().applied_active);
+        playback.update(&json!({"type":"playback_changed","status":"playing"}), &tx);
+        gate.observe_playback(&playback);
+        assert!(gate.state.lock().unwrap().applied_active);
+        playback.update(&json!({"type":"device_changed","is_active":false}), &tx);
+        gate.observe_playback(&playback);
+        assert!(!gate.state.lock().unwrap().applied_active);
+        playback.update(&json!({"type":"device_changed","is_active":true}), &tx);
+        gate.observe_playback(&playback);
+        assert!(!gate.state.lock().unwrap().applied_active);
     }
 
     #[test]

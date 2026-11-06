@@ -738,20 +738,15 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
                 Err(_) => break,
             },
             event = observed.recv_async() => if let Ok(event) = event {
-                // A stopped read model can be re-established by Playing without
-                // another SDK TrackChanged. Old processed frames cannot qualify it.
-                if matches!(&event, PlayerEvent::TrackChanged { .. })
-                    || (matches!(&event, PlayerEvent::Playing { .. }) && shared.snapshot().track.is_none())
-                {
-                    pcm_baseline = player.as_ref().and_then(|player| player.audio_stats()).map_or(0, |stats| stats.processed_frames);
-                }
+                observe_pcm_boundary(
+                    &event, shared.snapshot().track.is_none(), &mut pcm_baseline,
+                    || player.as_ref().and_then(|player| player.audio_stats()).map_or(0, |stats| stats.processed_frames),
+                    || { if let Some(player) = &player { player.flush_audio(); } },
+                );
                 match &event {
                     PlayerEvent::Authentication { logged_in, .. } => sdk_authenticated = *logged_in,
                     PlayerEvent::Reconnecting => sdk_authenticated = false,
                     _ => {},
-                }
-                if matches!(&event,PlayerEvent::TrackChanged {..}|PlayerEvent::Stopped|PlayerEvent::Reconnecting|PlayerEvent::LocallyInactive) {
-                    if let Some(player)=&player {player.flush_audio();}
                 }
                 pending_playback.note(&event);
                 let previous = shared.snapshot();
@@ -1205,9 +1200,64 @@ fn audio_telemetry(
     }
 }
 
+fn observe_pcm_boundary(
+    event: &PlayerEvent,
+    missing_track: bool,
+    baseline: &mut u64,
+    processed_frames: impl FnOnce() -> u64,
+    flush: impl FnOnce(),
+) {
+    // Per-item qualification needs new PCM even when the SDK stream continues.
+    if matches!(event, PlayerEvent::TrackChanged { .. })
+        || (matches!(event, PlayerEvent::Playing { .. }) && missing_track)
+    {
+        *baseline = processed_frames();
+    }
+    if matches!(
+        event,
+        PlayerEvent::Stopped | PlayerEvent::Reconnecting | PlayerEvent::LocallyInactive
+    ) {
+        flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn natural_track_boundary_requalifies_pcm_without_flushing_the_stream() {
+        let event = PlayerEvent::TrackChanged {
+            uri: "spotify:track:next".into(),
+        };
+        let mut baseline = 0;
+        let mut flushes = 0;
+        observe_pcm_boundary(&event, false, &mut baseline, || 1234, || flushes += 1);
+        assert_eq!(baseline, 1234);
+        assert_eq!(flushes, 0, "metadata is not a PCM discontinuity");
+        let playing = PlayerEvent::Playing {
+            uri: "spotify:track:next".into(),
+            position_ms: 0,
+        };
+        observe_pcm_boundary(&playing, false, &mut baseline, || 1300, || flushes += 1);
+        assert_eq!(baseline, 1234);
+        observe_pcm_boundary(&playing, true, &mut baseline, || 1400, || flushes += 1);
+        assert_eq!(baseline, 1400, "Stop-to-Play must exclude old PCM");
+        for event in [
+            PlayerEvent::Stopped,
+            PlayerEvent::Reconnecting,
+            PlayerEvent::LocallyInactive,
+        ] {
+            observe_pcm_boundary(
+                &event,
+                false,
+                &mut baseline,
+                || panic!("no new item"),
+                || flushes += 1,
+            );
+        }
+        assert_eq!(flushes, 3);
+    }
     pub(super) fn fixture() -> Arc<Shared> {
         let mut snapshot = Snapshot::starting("/unused/test/config".into(), "Device".into());
         snapshot.web_api_ready = true;

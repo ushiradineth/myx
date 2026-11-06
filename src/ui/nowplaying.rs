@@ -67,20 +67,13 @@ pub(crate) fn render_nowplaying_view(
     };
     out.art = Some(art_rect);
 
-    match app.playback.now.as_ref().and_then(|n| n.cover.as_ref()) {
-        _ if repaint == ArtRepaint::Wipe => wipe_area(f, art_rect),
-        // Writing the escape means transmitting the image, so only do it when
-        // something actually asked for it. A theme fade repaints every glyph on
-        // screen dozens of times, and re-sending the cover on each of those is
-        // what made it flicker.
-        Some(cover) if repaint == ArtRepaint::Draw || cover.needs_send(art_rect) => {
-            cover.render(f, art_rect)
-        }
-        // Already on screen: hold the cells so nothing overwrites the picture,
-        // and send nothing.
-        Some(_) => hold_area(f, art_rect),
-        None => wipe_area(f, art_rect),
-    }
+    let cover = app
+        .playback
+        .now
+        .as_ref()
+        .and_then(|n| n.cover.as_ref())
+        .or(app.session.transition_cover.as_ref());
+    render_cover(f, cover, art_rect, repaint);
 
     if let Some(n) = app.playback.now.as_ref() {
         let text_rect = Rect {
@@ -114,6 +107,23 @@ pub(crate) fn render_nowplaying_view(
     if viz_area.width > 0 && viz_area.height > 0 {
         out.spectrum = Some(viz_area);
         render_visualizer(f, app, theme, viz_area);
+    }
+}
+
+fn render_cover(f: &mut Frame, cover: Option<&Cover>, art_rect: Rect, repaint: ArtRepaint) {
+    match cover {
+        _ if repaint == ArtRepaint::Wipe => wipe_area(f, art_rect),
+        // Writing the escape means transmitting the image, so only do it when
+        // something actually asked for it. A theme fade repaints every glyph on
+        // screen dozens of times, and re-sending the cover on each of those is
+        // what made it flicker.
+        Some(cover) if repaint == ArtRepaint::Draw || cover.needs_send(art_rect) => {
+            cover.render(f, art_rect)
+        }
+        // Already on screen: hold the cells so nothing overwrites the picture,
+        // and send nothing.
+        Some(_) => hold_area(f, art_rect),
+        None => wipe_area(f, art_rect),
     }
 }
 
@@ -219,4 +229,54 @@ pub(crate) fn render_volume(
         width: VLEV.len() as u16,
         height: 1,
     });
+}
+
+#[cfg(test)]
+mod artwork_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn palette_frames_hold_artwork_until_an_atomic_replacement() {
+        let mut terminal = Terminal::new(TestBackend::new(8, 4)).unwrap();
+        let area = Rect::new(1, 1, 4, 2);
+        let cover = |rgb| {
+            Cover::from_image(
+                image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb(rgb))),
+                Picker::halfblocks(),
+            )
+        };
+        let outgoing = cover([255, 0, 0]);
+        let incoming = cover([0, 0, 255]);
+        terminal
+            .draw(|f| render_cover(f, Some(&outgoing), area, ArtRepaint::Draw))
+            .unwrap();
+        let original = terminal.backend().buffer().clone();
+        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let theme = Theme::lerp(&TOKYONIGHT, &myx::theme::GRUVBOX, progress);
+            terminal
+                .draw(|f| {
+                    f.render_widget(
+                        Block::default().style(Style::default().bg(theme.background.into())),
+                        f.area(),
+                    );
+                    render_cover(f, Some(&outgoing), area, ArtRepaint::Idle);
+                })
+                .unwrap();
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    assert_eq!(terminal.backend().buffer()[(x, y)], original[(x, y)]);
+                }
+            }
+        }
+        terminal
+            .draw(|f| render_cover(f, Some(&incoming), area, ArtRepaint::Draw))
+            .unwrap();
+        assert_ne!(terminal.backend().buffer()[(1, 1)], original[(1, 1)]);
+        assert!(!incoming.needs_send(area));
+        terminal
+            .draw(|f| render_cover(f, None, area, ArtRepaint::Idle))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), " ");
+    }
 }

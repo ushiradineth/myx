@@ -429,7 +429,7 @@ async fn run_ui(
                     let repaint = app.art_repaint;
                     let drawn = terminal.draw(|f| render(f, &app, &mut out, repaint)).map(|_| ());
                     let restore_result = if drawn.is_ok() && restore_art && !overlay_open && app.view.mode == RightView::NowPlaying {
-                        out.art.zip(app.playback.now.as_ref().and_then(|now| now.cover.as_ref()))
+                        out.art.zip(app.playback.now.as_ref().and_then(|now| now.cover.as_ref()).or(app.session.transition_cover.as_ref()))
                             .map(|(area, cover)| cover.render_direct(terminal.backend_mut(), area))
                     } else { None };
                     if !in_tmux { let _ = execute!(io::stdout(), EndSynchronizedUpdate); }

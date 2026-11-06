@@ -390,6 +390,29 @@ fn sdk(result: anyhow::Result<()>) -> Result<(), IpcError> {
     })
 }
 
+fn apply_volume<P>(
+    shared: &Shared,
+    mailbox: &Mailbox<P>,
+    intent: &Intent<P>,
+    percent: u8,
+    submit: impl FnOnce() -> Result<(), IpcError>,
+) -> Result<bool, IpcError> {
+    let snapshot = shared.snapshot();
+    // Repeated keys can queue the same absolute target before the viewer sees
+    // its first update. An unchanged SDK volume need not emit another event.
+    if snapshot.locally_active
+        && snapshot.volume_observed_revision > 0
+        && snapshot.volume == percent
+    {
+        return Ok(true);
+    }
+    let after = shared.observations.load(Ordering::Acquire);
+    submit()?;
+    wait(shared, mailbox, intent, after, |s| {
+        s.volume_observed_revision > snapshot.volume_observed_revision && s.volume == percent
+    })
+}
+
 fn load_observed(
     snapshot: &Snapshot,
     before: &Snapshot,
@@ -671,7 +694,9 @@ fn execute(
             PlayerCommand::Previous => sdk(player.prev())?,
             PlayerCommand::Seek { position_ms } => sdk(player.seek(*position_ms))?,
             PlayerCommand::Volume { percent } if *percent <= 100 => {
-                sdk(player.set_volume(((u32::from(*percent) * 65535) / 100) as u16))?
+                return apply_volume(shared, mailbox, intent, *percent, || {
+                    sdk(player.set_volume(((u32::from(*percent) * 65535) / 100) as u16))
+                });
             }
             PlayerCommand::Shuffle { enabled } => sdk(player.shuffle(*enabled))?,
             PlayerCommand::Repeat { mode } => sdk(player.set_repeat(*mode))?,
@@ -700,10 +725,6 @@ fn execute(
             }
         }
         wait(shared, mailbox, intent, after, |s| match &intent.command {
-            PlayerCommand::Volume { percent } => {
-                s.volume_observed_revision > snapshot.volume_observed_revision
-                    && s.volume == *percent
-            }
             PlayerCommand::Shuffle { enabled } => {
                 s.options_observed_revision > snapshot.options_observed_revision
                     && s.shuffle == *enabled
@@ -738,6 +759,73 @@ fn execute(
 mod tests {
     use super::*;
     const A: &str = "spotify:track:0123456789abcdefghijkl";
+
+    #[test]
+    fn repeated_volume_target_does_not_write_or_fence_later_controls() {
+        let shared = super::super::tests::fixture();
+        shared.update(|s| {
+            s.locally_active = true;
+            s.volume = 50;
+            s.volume_observed_revision = 1;
+        });
+        let mailbox = Arc::new(Mailbox::default());
+        for _ in 0..3 {
+            mailbox
+                .enqueue(&shared, (), PlayerCommand::Volume { percent: 55 })
+                .unwrap();
+        }
+        mailbox.enqueue(&shared, (), PlayerCommand::Pause).unwrap();
+        let writes = AtomicU64::new(0);
+        run_worker(shared.clone(), mailbox, |state, input, intent| {
+            if let PlayerCommand::Volume { percent } = intent.command {
+                let result = apply_volume(state, input, intent, percent, || {
+                    if writes.fetch_add(1, Ordering::AcqRel) == 0 {
+                        state.update(|s| {
+                            s.volume = percent;
+                            s.volume_observed_revision += 1;
+                        });
+                        state.observations.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Ok(())
+                });
+                if !matches!(result, Ok(true)) {
+                    state.shutdown.store(true, Ordering::Release);
+                }
+                assert!(
+                    matches!(result, Ok(true)),
+                    "duplicate volume must already be satisfied"
+                );
+                result
+            } else {
+                state.shutdown.store(true, Ordering::Release);
+                Ok(true)
+            }
+        });
+        assert_eq!(writes.load(Ordering::Acquire), 1);
+        assert_eq!(shared.snapshot().control_error, None);
+        assert!(!shared.snapshot().control_pending);
+    }
+
+    #[test]
+    fn volume_default_or_inactive_state_is_not_confirmation() {
+        for (active, revision) in [(true, 0), (false, 1)] {
+            let shared = super::super::tests::fixture();
+            shared.update(|s| {
+                s.locally_active = active;
+                s.volume = 100;
+                s.volume_observed_revision = revision;
+            });
+            let mailbox = Mailbox::default();
+            mailbox
+                .enqueue(&shared, (), PlayerCommand::Volume { percent: 100 })
+                .unwrap();
+            let intent = mailbox.queue.lock().unwrap().pop_front().unwrap();
+            let result = apply_volume(&shared, &mailbox, &intent, 100, || {
+                Err(IpcError::new(ErrorCode::Unavailable, "not submitted"))
+            });
+            assert!(matches!(result, Err(error) if error.code == ErrorCode::Unavailable));
+        }
+    }
 
     #[test]
     fn liked_resolution_fetches_all_pages_and_keeps_duplicate_exact_offset() {

@@ -36,37 +36,34 @@ pub(crate) fn handle_engine_event(
                     .engine
                     .request_queue_page(Some(snapshot.queue_revision), 0);
             }
+            let artwork = apply_visual_snapshot(
+                &mut app.session,
+                &mut app.playback,
+                &app.transport.canonical,
+                &snapshot,
+                authority_changed,
+            );
+            if app
+                .transport
+                .canonical
+                .track
+                .as_ref()
+                .map(|track| &track.uri)
+                != snapshot.track.as_ref().map(|track| &track.uri)
+            {
+                app.view.lyrics.clear();
+                app.view.lyrics_synced = false;
+            }
             app.transport = transport;
-            app.playback
-                .apply_snapshot(&snapshot, myx::domain::playback::now_ms());
             if authority_changed {
                 // Canonical playback remains the daemon's; only viewer work and
                 // account-derived catalog rows are discarded. The frame loop
                 // demand-loads the selected section, not every user collection.
                 app.status = "daemon authority changed; reloading current section…".into();
                 app.art_repaint = ArtRepaint::Wipe;
-                if let Some(now) = app.playback.now.as_mut() {
-                    now.cover = None;
-                }
-                if let Some(track) = snapshot.track.as_ref() {
-                    request_artwork(
-                        app,
-                        TrackMetadata {
-                            uri: track.uri.clone(),
-                            title: track.title.clone().unwrap_or_default(),
-                            artist: track
-                                .artists
-                                .as_ref()
-                                .map(|artists| artists.join(", "))
-                                .unwrap_or_default(),
-                            album: track.album.clone().unwrap_or_default(),
-                            duration_ms: track.duration_ms.unwrap_or(0).min(u64::from(u32::MAX))
-                                as u32,
-                            cover_url: track.artwork_url.clone(),
-                        },
-                        meta_tx,
-                    );
-                }
+            }
+            if let Some(meta) = artwork {
+                request_artwork(app, meta, meta_tx);
             }
             if let Some(message) = snapshot
                 .control_outcome
@@ -78,6 +75,15 @@ pub(crate) fn handle_engine_event(
             }
         }
         EngineEvent::TrackChanged { uri } => {
+            if app
+                .transport
+                .canonical
+                .track
+                .as_ref()
+                .is_some_and(|track| track.uri == uri)
+            {
+                return;
+            }
             app.session.artwork_request.cancel();
             app.session.lyrics_request.cancel();
             app.session.lyrics_key = None;
@@ -112,10 +118,8 @@ pub(crate) fn handle_engine_event(
                 app.view.lyrics.clear();
                 app.view.lyrics_synced = false;
             }
-            // Establish the model synchronously, before the following Playing
-            // event. Cover HTTP must not lose the first playhead/paused update.
-            // Metadata/artwork supplements never replace the canonical clock.
-            app.playback.apply_sdk_metadata(&meta);
+            // ReadModel already applied this track and scheduled its artwork.
+            // Still invalidate lyrics above when canonical text was enriched.
             if app
                 .transport
                 .canonical
@@ -123,9 +127,12 @@ pub(crate) fn handle_engine_event(
                 .as_ref()
                 .is_some_and(|track| track.uri == meta.uri)
             {
-                app.playback
-                    .apply_snapshot(&app.transport.canonical, myx::domain::playback::now_ms());
+                return;
             }
+            // Establish the model synchronously, before the following Playing
+            // event. Cover HTTP must not lose the first playhead/paused update.
+            // Metadata/artwork supplements never replace the canonical clock.
+            app.playback.apply_sdk_metadata(&meta);
             request_artwork(app, meta, meta_tx);
         }
         EngineEvent::QueueChanged { entries } => {
@@ -168,6 +175,7 @@ pub(crate) fn handle_engine_event(
             app.playback.set_local_position(position_ms, true);
         }
         EngineEvent::Stopped => {
+            app.session.transition_cover = None;
             app.session.artwork_request.cancel();
             app.session.lyrics_request.cancel();
             app.session.lyrics_key = None;
@@ -230,6 +238,59 @@ fn request_artwork(app: &mut App, meta: TrackMetadata, tx: &flume::Sender<Reply<
     });
 }
 
+fn apply_visual_snapshot(
+    session: &mut SessionState,
+    playback: &mut PlaybackState,
+    previous: &Snapshot,
+    snapshot: &Snapshot,
+    authority_changed: bool,
+) -> Option<TrackMetadata> {
+    let track_changed = previous.track.as_ref().map(|track| &track.uri)
+        != snapshot.track.as_ref().map(|track| &track.uri);
+    if authority_changed || snapshot.track.is_none() {
+        session.transition_cover = None;
+    } else if track_changed {
+        if let Some(cover) = playback.now.as_mut().and_then(|now| now.cover.take()) {
+            session.transition_cover = Some(cover);
+        }
+    }
+    if authority_changed || track_changed {
+        session.artwork_request.cancel();
+        session.lyrics_request.cancel();
+        session.lyrics_key = None;
+        session.lyrics_error = None;
+        session.pending_meta = Some(
+            snapshot
+                .track
+                .as_ref()
+                .map(|track| track.uri.clone())
+                .unwrap_or_default(),
+        );
+    }
+    playback.apply_snapshot(snapshot, myx::domain::playback::now_ms());
+    if authority_changed {
+        if let Some(now) = playback.now.as_mut() {
+            now.cover = None;
+        }
+    }
+    snapshot
+        .track
+        .as_ref()
+        .filter(|_| authority_changed || previous.track != snapshot.track)
+        .map(|track| TrackMetadata {
+            uri: track.uri.clone(),
+            title: track.title.clone().unwrap_or_default(),
+            artist: track
+                .artists
+                .as_ref()
+                .map(|artists| artists.join(", "))
+                .unwrap_or_default(),
+            album: track.album.clone().unwrap_or_default(),
+            duration_ms: track.duration_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            cover_url: track.artwork_url.clone(),
+        })
+}
+
 fn queue_display<'a>(
     entries: Vec<(String, String)>,
     known: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -272,13 +333,36 @@ pub(crate) fn meta_is_current(pending: Option<&str>, meta_uri: &str) -> bool {
 }
 
 pub(crate) fn apply_meta(app: &mut App, meta: TrackMeta) {
+    if apply_artwork(
+        &mut app.session,
+        &mut app.playback,
+        &mut app.theme,
+        app.svc.picker.clone(),
+        app.transport.playback_started,
+        meta,
+    ) {
+        // Replace in one frame, without wiping between the two covers.
+        app.art_repaint = ArtRepaint::Draw;
+    }
+}
+
+fn apply_artwork(
+    session: &mut SessionState,
+    playback: &mut PlaybackState,
+    theme: &mut ThemeState,
+    picker: Picker,
+    playback_started: bool,
+    meta: TrackMeta,
+) -> bool {
     // Metadata fetches run on independent blocking tasks, so skipping quickly
     // (n/b) can land an earlier track's reply after a later one. Applying it
     // would replace the whole NowPlaying — title, artist and cover — with the
     // wrong track's data.
-    if !meta_is_current(app.session.pending_meta.as_deref(), &meta.uri) {
-        return;
+    if !meta_is_current(session.pending_meta.as_deref(), &meta.uri) {
+        return false;
     }
+
+    session.transition_cover = None;
 
     if meta.image.image.is_none() && meta.image.url.is_some() {
         liblog("cover: no decoded artwork for current track");
@@ -288,43 +372,34 @@ pub(crate) fn apply_meta(app: &mut App, meta: TrackMeta) {
         .image
         .image
         .as_ref()
-        .map(|img| Cover::from_image(img.clone(), app.svc.picker.clone()))
+        .map(|img| Cover::from_image(img.clone(), picker))
         .or_else(|| {
-            app.playback
+            playback
                 .now
                 .as_mut()
                 .filter(|now| now.uri == meta.uri)
                 .and_then(|now| now.cover.take())
         });
-    // A different cover encodes to a different symbol, so the diff emits it on
-    // its own — no wipe, which would flash a blank box between the two covers.
-    app.art_repaint = ArtRepaint::Draw;
-
-    app.playback.now = Some(NowPlaying {
+    playback.now = Some(NowPlaying {
         uri: meta.uri,
         title: meta.title,
         artist: meta.artist,
         album: meta.album,
         duration_ms: meta.duration_ms,
-        position_ms: app
-            .playback
-            .now
-            .as_ref()
-            .map(|n| n.position_ms)
-            .unwrap_or(0),
+        position_ms: playback.now.as_ref().map(|n| n.position_ms).unwrap_or(0),
         position_at: Instant::now(),
-        is_playing: app
-            .playback
+        is_playing: playback
             .now
             .as_ref()
             .map(|n| n.is_playing)
-            .unwrap_or(app.transport.playback_started),
+            .unwrap_or(playback_started),
         cover,
     });
 
-    if let Some(theme) = meta.theme {
-        app.theme.start_fade(theme);
+    if let Some(palette) = meta.theme {
+        theme.start_fade(palette);
     }
+    true
 }
 
 /// Does this row carry a playable context URI, and under what name?
@@ -359,7 +434,226 @@ pub(crate) fn play_selected_context(app: &mut App, shuffle: bool) {
 
 #[cfg(test)]
 mod artwork_tests {
-    use super::meta_is_current;
+    use super::*;
+
+    fn snapshot(uri: &str) -> Snapshot {
+        let mut snapshot = Snapshot::starting(String::new(), "fixture".into());
+        snapshot.track = Some(myx::domain::TrackMetadata::pending(
+            myx::domain::ItemKind::Track,
+            uri.into(),
+        ));
+        snapshot
+    }
+
+    #[test]
+    fn canonical_track_change_requests_artwork_without_supplemental_events() {
+        let old = snapshot("spotify:track:old");
+        let new = snapshot("spotify:track:new");
+        let mut playback = PlaybackState::from_snapshot(&old, 0);
+        let mut session = SessionState {
+            pending_meta: Some(old.track.as_ref().unwrap().uri.clone()),
+            ..SessionState::default()
+        };
+        let request = apply_visual_snapshot(&mut session, &mut playback, &old, &new, false);
+        assert_eq!(request.unwrap().uri, "spotify:track:new");
+        assert_eq!(session.pending_meta.as_deref(), Some("spotify:track:new"));
+    }
+
+    #[test]
+    fn outgoing_artwork_survives_the_canonical_track_handoff() {
+        let old = snapshot("spotify:track:old");
+        let new = snapshot("spotify:track:new");
+        let mut playback = PlaybackState::from_snapshot(&old, 0);
+        playback.now.as_mut().unwrap().cover = Some(Cover::from_image(
+            image::DynamicImage::new_rgb8(2, 2),
+            Picker::halfblocks(),
+        ));
+        let mut session = SessionState::default();
+        apply_visual_snapshot(&mut session, &mut playback, &old, &new, false);
+        assert!(playback.now.as_ref().unwrap().cover.is_none());
+        assert!(
+            session.transition_cover.is_some(),
+            "outgoing artwork must remain visible until its replacement arrives"
+        );
+    }
+
+    fn cover() -> Cover {
+        Cover::from_image(image::DynamicImage::new_rgb8(2, 2), Picker::halfblocks())
+    }
+
+    #[test]
+    fn visual_snapshot_handles_enrichment_repeated_ticks_rapid_skips_and_stop() {
+        let old = snapshot("spotify:track:old");
+        let new = snapshot("spotify:track:new");
+        let mut playback = PlaybackState::from_snapshot(&old, 0);
+        playback.now.as_mut().unwrap().cover = Some(cover());
+        let mut session = SessionState::default();
+        let old_request = session.artwork_request.start();
+        apply_visual_snapshot(&mut session, &mut playback, &old, &new, false);
+        assert!(!session.artwork_request.finish(old_request));
+
+        let mut enriched = new.clone();
+        enriched.track.as_mut().unwrap().artwork_url = Some("https://example.test/cover".into());
+        let request =
+            apply_visual_snapshot(&mut session, &mut playback, &new, &enriched, false).unwrap();
+        assert_eq!(
+            request.cover_url.as_deref(),
+            Some("https://example.test/cover")
+        );
+        let id = session.artwork_request.start();
+        assert!(
+            apply_visual_snapshot(&mut session, &mut playback, &enriched, &enriched, false)
+                .is_none()
+        );
+        assert!(
+            session.artwork_request.finish(id),
+            "position ticks must not cancel artwork"
+        );
+        assert!(session.transition_cover.is_some());
+
+        let third = snapshot("spotify:track:third");
+        apply_visual_snapshot(&mut session, &mut playback, &enriched, &third, false);
+        assert!(
+            session.transition_cover.is_some(),
+            "rapid skips keep the last displayed artwork"
+        );
+        assert!(!meta_is_current(
+            session.pending_meta.as_deref(),
+            "spotify:track:new"
+        ));
+
+        let mut stopped = third.clone();
+        stopped.track = None;
+        assert!(
+            apply_visual_snapshot(&mut session, &mut playback, &third, &stopped, false).is_none()
+        );
+        assert!(session.transition_cover.is_none());
+        assert!(playback.now.is_none());
+        assert!(!meta_is_current(
+            session.pending_meta.as_deref(),
+            "spotify:track:third"
+        ));
+    }
+
+    #[test]
+    fn authority_replacement_discards_both_current_and_outgoing_artwork() {
+        let snapshot = snapshot("spotify:track:same");
+        let mut playback = PlaybackState::from_snapshot(&snapshot, 0);
+        playback.now.as_mut().unwrap().cover = Some(cover());
+        let mut session = SessionState {
+            transition_cover: Some(cover()),
+            ..SessionState::default()
+        };
+        assert!(
+            apply_visual_snapshot(&mut session, &mut playback, &snapshot, &snapshot, true)
+                .is_some()
+        );
+        assert!(session.transition_cover.is_none());
+        assert!(playback.now.as_ref().unwrap().cover.is_none());
+    }
+
+    #[test]
+    fn artwork_completion_replaces_outgoing_pixels_and_starts_only_the_current_palette() {
+        let old = snapshot("spotify:track:old");
+        let new = snapshot("spotify:track:new");
+        let mut playback = PlaybackState::from_snapshot(&old, 0);
+        playback.now.as_mut().unwrap().cover = Some(cover());
+        let mut session = SessionState::default();
+        apply_visual_snapshot(&mut session, &mut playback, &old, &new, false);
+        let mut theme = ThemeState {
+            displayed: TOKYONIGHT,
+            target: TOKYONIGHT,
+            fade: None,
+        };
+        let meta = |uri: &str, image| TrackMeta {
+            uri: uri.into(),
+            title: "Title".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 200_000,
+            image: TrackImage { image, url: None },
+            theme: Some(myx::theme::GRUVBOX),
+        };
+        assert!(!apply_artwork(
+            &mut session,
+            &mut playback,
+            &mut theme,
+            Picker::halfblocks(),
+            false,
+            meta(
+                "spotify:track:old",
+                Some(image::DynamicImage::new_rgb8(2, 2))
+            )
+        ));
+        assert!(session.transition_cover.is_some());
+        assert!(theme.fade.is_none());
+        assert!(apply_artwork(
+            &mut session,
+            &mut playback,
+            &mut theme,
+            Picker::halfblocks(),
+            false,
+            meta(
+                "spotify:track:new",
+                Some(image::DynamicImage::new_rgb8(2, 2))
+            )
+        ));
+        assert!(session.transition_cover.is_none());
+        assert!(playback.now.as_ref().unwrap().cover.is_some());
+        assert_eq!(theme.displayed.background.r, TOKYONIGHT.background.r);
+        assert_eq!(theme.target.background.r, myx::theme::GRUVBOX.background.r);
+        assert!(theme.fade.is_some());
+
+        // A same-track image failure retains its already decoded cover.
+        let mut failed = meta("spotify:track:new", None);
+        failed.theme = None;
+        assert!(apply_artwork(
+            &mut session,
+            &mut playback,
+            &mut theme,
+            Picker::halfblocks(),
+            false,
+            failed
+        ));
+        assert!(playback.now.as_ref().unwrap().cover.is_some());
+    }
+
+    #[test]
+    fn failed_artwork_releases_the_outgoing_cover_without_reusing_it_for_the_new_track() {
+        let old = snapshot("spotify:track:old");
+        let new = snapshot("spotify:track:new");
+        let mut playback = PlaybackState::from_snapshot(&old, 0);
+        playback.now.as_mut().unwrap().cover = Some(cover());
+        let mut session = SessionState::default();
+        apply_visual_snapshot(&mut session, &mut playback, &old, &new, false);
+        let mut theme = ThemeState {
+            displayed: TOKYONIGHT,
+            target: TOKYONIGHT,
+            fade: None,
+        };
+        assert!(apply_artwork(
+            &mut session,
+            &mut playback,
+            &mut theme,
+            Picker::halfblocks(),
+            false,
+            TrackMeta {
+                uri: "spotify:track:new".into(),
+                title: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                duration_ms: 0,
+                image: TrackImage {
+                    image: None,
+                    url: None
+                },
+                theme: None,
+            },
+        ));
+        assert!(session.transition_cover.is_none());
+        assert!(playback.now.as_ref().unwrap().cover.is_none());
+        assert!(theme.fade.is_none());
+    }
 
     #[test]
     fn delayed_artwork_is_rejected_after_track_change_or_stop() {

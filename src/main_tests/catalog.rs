@@ -335,6 +335,7 @@ fn broad_search_reports_the_real_provider_offset_bound_and_keeps_reachable_rows(
         let kind = &params["type"];
         let container = format!("{kind}s");
         let offset = params.get("offset").map(|s| s.parse::<usize>().unwrap()).unwrap_or(0);
+        assert!(offset <= 1000, "must not request an unreachable offset");
         let total = if kind == "track" { 12000 } else { 0 };
         let items: Vec<_> = if total == 0 { Vec::new() } else { (offset..offset + 10).map(|id| json!({"name":format!("A {id}"),"uri":format!("spotify:track:{id}")})).collect() };
         Ok(json!({(container):{"items":items,"offset":offset,"total":total,"next":if total > offset + 10 { Some(format!("/v1/search?q=broad&type={kind}&limit=10&offset={}", offset + 10)) } else { None }}}))
@@ -348,10 +349,240 @@ fn broad_search_reports_the_real_provider_offset_bound_and_keeps_reachable_rows(
 }
 
 #[test]
+fn artist_name_search_keeps_rows_when_totals_change_between_pages() {
+    for total in [1, 3] {
+        let mut calls = 0;
+        let result = search_with(
+            |path| {
+                if !path.contains("type=artist&") {
+                    return Ok(empty_search_response(path));
+                }
+                assert!(path.contains("q=AC%2FDC"));
+                calls += 1;
+                Ok(json!({"artists":{
+                    "items":[{"name":format!("AC/DC {calls}"),"uri":format!("spotify:artist:{calls}")}],
+                    "offset":if calls == 1 {0} else {10},
+                    "total":if calls == 1 {2} else {total},
+                    "next":if calls == 1 {Some("https://api.spotify.com/v1/search?q=AC%2FDC&type=artist&limit=10&offset=10")} else {None}
+                }}))
+            },
+            "AC/DC",
+        ).unwrap_or_else(|error| panic!("search total drift must retain results: {error:?}"));
+        assert_eq!(calls, 2);
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .filter(|row| row.uri.starts_with("spotify:artist:"))
+                .count(),
+            2
+        );
+        assert!(result.notice.unwrap().contains("partial search results"));
+    }
+}
+
+#[test]
+fn artist_name_search_keeps_a_short_terminal_page_with_an_advertised_larger_total() {
+    let result = search_with(
+        |path| {
+            if !path.contains("type=artist&") {
+                return Ok(empty_search_response(path));
+            }
+            Ok(json!({"artists":{"items":[{"name":"AC/DC","uri":"spotify:artist:acdc"}],"offset":0,"total":8,"next":null}}))
+        },
+        "AC/DC",
+    ).unwrap_or_else(|error| panic!("short search EOF must retain results: {error:?}"));
+    assert!(result.rows.iter().any(|row| row.name == "AC/DC"));
+    assert!(result.notice.unwrap().contains("partial search results"));
+}
+
+#[test]
+fn artist_name_search_keeps_ten_tracks_when_terminal_page_reports_only_five() {
+    let mut track_calls = 0;
+    let result = search_with(
+        |path| {
+            if !path.contains("type=track&") {
+                return Ok(empty_search_response(path));
+            }
+            assert!(path.contains("q=AC%2FDC"));
+            track_calls += 1;
+            let items: Vec<_> = (0..10)
+                .map(|id| json!({"name":format!("Track {id}"),"uri":format!("spotify:track:{id}")}))
+                .collect();
+            Ok(json!({"tracks":{"items":items,"total":5,"offset":0,"next":null}}))
+        },
+        "AC/DC",
+    )
+    .unwrap_or_else(|error| panic!("search must retain tracks beyond reported total: {error:?}"));
+    assert_eq!(track_calls, 1);
+    let tracks: Vec<_> = result.rows.iter().filter(|row| row.is_track()).collect();
+    assert_eq!(tracks.len(), 10);
+    assert_eq!(tracks.last().unwrap().uri, "spotify:track:9");
+    let notice = result.notice.expect("count mismatch must be visible");
+    assert!(notice.contains("partial search results"));
+    assert!(notice.contains("Songs:"));
+}
+
+fn empty_search_response(path: &str) -> Value {
+    let url = reqwest::Url::parse(&format!("https://api.spotify.com{path}")).unwrap();
+    let kind = url.query_pairs().find(|(key, _)| key == "type").unwrap().1;
+    json!({(format!("{kind}s")):{"items":[],"offset":0,"total":0,"next":null}})
+}
+
+#[test]
+fn search_follows_short_pages_and_stops_an_empty_continuation_with_a_notice() {
+    let mut calls = 0;
+    let result = search_with(
+        |path| {
+            if !path.contains("type=track&") {
+                return Ok(empty_search_response(path));
+            }
+            calls += 1;
+            let items = if calls < 3 {
+                json!([{"name":format!("Track {calls}"),"uri":format!("spotify:track:{calls}")}])
+            } else {
+                json!([])
+            };
+            Ok(
+                json!({"tracks":{"items":items,"offset":(calls-1)*10,"total":30,
+            "next":format!("/v1/search?q=query&type=track&limit=10&offset={}", calls*10)}}),
+            )
+        },
+        "query",
+    )
+    .unwrap();
+    assert_eq!(calls, 3);
+    assert_eq!(result.rows.iter().filter(|row| row.is_track()).count(), 2);
+    assert!(result.notice.unwrap().contains("partial search results"));
+}
+
+#[test]
+fn search_stops_at_the_provider_offset_bound_even_when_total_is_small() {
+    let mut calls = 0;
+    let result = search_with(|path| {
+        if !path.contains("type=track&") {
+            return Ok(empty_search_response(path));
+        }
+        calls += 1;
+        assert_eq!(calls, 1, "must not fetch a provider-forbidden continuation");
+        Ok(json!({"tracks":{"items":[{"name":"A","uri":"spotify:track:a"}],"offset":0,"total":1,
+            "next":"/v1/search?q=query&type=track&limit=10&offset=1001"}}))
+    }, "query").unwrap();
+    assert_eq!(result.rows.iter().filter(|row| row.is_track()).count(), 1);
+    assert!(result.notice.unwrap().contains("maximum search offset"));
+}
+
+#[test]
+fn search_rejects_malformed_pages_but_accepts_successfully_empty_groups() {
+    let empty = search_with(|path| Ok(empty_search_response(path)), "query").unwrap();
+    assert!(empty.rows.is_empty());
+    assert!(empty.notice.is_none());
+    for page in [
+        json!({"items":[],"offset":0,"total":0}),
+        json!({"items":[],"offset":0,"total":0,"next":false}),
+        json!({"items":[],"offset":0,"total":"0","next":null}),
+        json!({"items":[],"offset":1,"total":0,"next":null}),
+        json!({"items":[],"total":0,"next":null}),
+        json!({"items":null,"offset":0,"total":0,"next":null}),
+        json!({"items":vec![Value::Null; 11],"offset":0,"total":11,"next":null}),
+    ] {
+        assert!(matches!(
+            search_with(|_| Ok(json!({"tracks":page})), "query"),
+            Err(ApiError::InvalidResponse)
+        ));
+    }
+}
+
+#[test]
+fn search_rejects_unsafe_or_nonprogressing_continuations_before_fetching_them() {
+    for next in [
+        "https://evil.test/v1/search?q=query&type=track&limit=10&offset=10",
+        "https://api.spotify.com.evil.test/v1/search?q=query&type=track&limit=10&offset=10",
+        "https://api.spotify.com:443/v1/search?q=query&type=track&limit=10&offset=10",
+        "https://api.spotify.com@evil.test/v1/search?q=query&type=track&limit=10&offset=10",
+        "//evil.test/v1/search?q=query&type=track&limit=10&offset=10",
+        "/v1/search/../search?q=query&type=track&limit=10&offset=10",
+        "/v1/%73earch?q=query&type=track&limit=10&offset=10",
+        "/v1/search?q=query&type=track&limit=10&offset=10#fragment",
+        "/v1/search?q=query&type=track&limit=10&offset=10\n",
+        "/v1/search?q=query&type=track&limit=10&offset=10\\",
+        "/v1/search?q=query&type=track&limit=10&offset=0",
+        "/v1/search?offset=0&limit=10&type=track&q=query",
+        "/v1/search?q=other&type=track&limit=10&offset=10",
+        "/v1/search?q=query&type=artist&limit=10&offset=10",
+        "/v1/search?q=query&type=track&limit=50&offset=10",
+        "/v1/search?q=query&type=track&limit=10&offset=10&offset=20",
+        "/v1/search?q=query&type=track&limit=10&offset=bad",
+    ] {
+        let mut calls = 0;
+        let result = search_with(
+            |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "unsafe continuation was fetched: {next}");
+                Ok(
+                    json!({"tracks":{"items":[{"name":"A","uri":"spotify:track:a"}],"offset":0,"total":2,"next":next}}),
+                )
+            },
+            "query",
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ApiError::InvalidRequest | ApiError::InvalidResponse)
+            ),
+            "accepted {next}"
+        );
+    }
+}
+
+#[test]
+fn search_later_page_errors_remain_typed_and_access_failures_are_explicit() {
+    for error in [
+        ApiError::Restricted,
+        ApiError::NotFound,
+        ApiError::Unauthorized,
+        ApiError::Offline,
+        ApiError::Quota,
+        ApiError::RateLimited {
+            retry_after_secs: Some(5),
+        },
+    ] {
+        let mut calls = 0;
+        let result = search_with(
+            |path| {
+                if !path.contains("type=track&") {
+                    return Ok(empty_search_response(path));
+                }
+                calls += 1;
+                if calls == 2 {
+                    return Err(error.clone());
+                }
+                Ok(
+                    json!({"tracks":{"items":[{"name":"A","uri":"spotify:track:a"}],"offset":0,"total":2,
+                "next":"/v1/search?q=query&type=track&limit=10&offset=10"}}),
+                )
+            },
+            "query",
+        );
+        assert_eq!(calls, 2);
+        if matches!(error, ApiError::Restricted | ApiError::NotFound) {
+            let result = result.unwrap();
+            assert!(
+                result.rows.is_empty(),
+                "failed group must not leak partial pages"
+            );
+            assert!(result.notice.unwrap().contains("Songs:"));
+        } else {
+            assert!(matches!(result, Err(actual) if actual == error));
+        }
+    }
+}
+
+#[test]
 fn search_access_restrictions_are_explicit_and_do_not_erase_authorized_groups() {
     let result = search_with(|path| {
         if !path.contains("type=track&") { return Err(ApiError::Restricted); }
-        Ok(json!({"tracks":{"items":[{"name":"A","uri":"spotify:track:a"}],"total":1,"next":null}}))
+        Ok(json!({"tracks":{"items":[{"name":"A","uri":"spotify:track:a"}],"offset":0,"total":1,"next":null}}))
     }, "query").unwrap();
     assert_eq!(result.rows.iter().filter(|row| row.is_track()).count(), 1);
     assert!(result.notice.unwrap().contains("partial search results"));
