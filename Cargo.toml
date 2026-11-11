@@ -1,6 +1,6 @@
 [package]
 name = "myx"
-version = "0.5.0-preview.3"
+version = "0.5.0-preview.4"
 edition = "2021"
 description = "A daemon-first Spotify player with an attachable terminal client"
 authors = ["Haseeb Khalid"]

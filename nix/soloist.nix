@@ -16,6 +16,7 @@ let
       patches = (old.patches or [ ]) ++ [
         ./compat/pulseaudio-darwin-reset-priority.patch
         ./compat/pulseaudio-json-utf8.patch
+        ./compat/pulseaudio-coreaudio-init-cleanup.patch
       ];
       doInstallCheck = true;
       installCheckPhase = ''
@@ -26,6 +27,8 @@ let
         $CC ${./tests/pulse-json.c} \
           "$out/lib/pulseaudio/libpulsecommon-17.0.dylib" -o pulse-json-test
         ./pulse-json-test
+        ${native.coreutils}/bin/timeout --kill-after=5s 30s ${native.bash}/bin/bash \
+          ${./tests/pulse-coreaudio-init.sh} "$out/bin"
         runHook postInstallCheck
       '';
     });

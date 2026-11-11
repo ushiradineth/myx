@@ -1,0 +1,22 @@
+From: myx native compatibility
+Subject: [PATCH] macosx: tolerate early device initialization failure
+
+An invalid or disappeared AudioObjectID fails before the card and rtpoll
+are allocated. The shared failure cleanup must not pass NULL to their
+asserting destructors.
+
+--- a/src/modules/macosx/module-coreaudio-device.c
++++ b/src/modules/macosx/module-coreaudio-device.c
+@@ -978,8 +978,10 @@ void pa__done(pa_module *m) {
+ 
+     pa_xfree(u->device_name);
+     pa_xfree(u->vendor_name);
+-    pa_rtpoll_free(u->rtpoll);
+-    pa_card_free(u->card);
++    if (u->rtpoll)
++        pa_rtpoll_free(u->rtpoll);
++    if (u->card)
++        pa_card_free(u->card);
+ 
+     pa_xfree(u);
+ }
