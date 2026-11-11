@@ -964,16 +964,38 @@ fn verify_device(shared: Arc<Shared>, pending: Arc<AtomicBool>, id: String) {
                 api.set_owned_device(Some(id));
             }
         }
-        shared.update(|snapshot| { if shared.generation.load(Ordering::Acquire) != generation { return; }
-            snapshot.catalog_available = true; snapshot.owned_device_verified = verified && snapshot.soloist_ready; reducer::readiness(snapshot);
-            if !verified { snapshot.message = Some("Owned Soloist device not found in this Web API account; reconcile authentication".into()); }
-            else if snapshot.readiness == ServiceState::Ready { snapshot.message = None; }
-            if verified && snapshot.track.is_some() && snapshot.metadata_status == MetadataStatus::Unavailable {
-                snapshot.metadata_status = MetadataStatus::Loading;
+        shared.update(|snapshot| {
+            if shared.generation.load(Ordering::Acquire) != generation {
+                return;
             }
+            observe_device_verification(snapshot, verified);
         });
         pending.store(false, Ordering::Release);
     });
+}
+
+fn observe_device_verification(snapshot: &mut Snapshot, verified: bool) {
+    snapshot.catalog_available = true;
+    snapshot.owned_device_verified = verified && snapshot.soloist_ready;
+    reducer::readiness(snapshot);
+    if !verified {
+        snapshot.message = Some(
+            "Owned Soloist device not found in this Web API account; reconcile authentication"
+                .into(),
+        );
+    } else if snapshot.readiness == ServiceState::Ready {
+        snapshot.message = None;
+        if !snapshot.control_pending && snapshot.control_error == Some(ErrorCode::SetupRequired) {
+            snapshot.control_error = None;
+            snapshot.control_outcome = None;
+        }
+    }
+    if verified
+        && snapshot.track.is_some()
+        && snapshot.metadata_status == MetadataStatus::Unavailable
+    {
+        snapshot.metadata_status = MetadataStatus::Loading;
+    }
 }
 
 fn maintain_api(shared: Arc<Shared>, pending: Arc<AtomicBool>) {
@@ -1224,6 +1246,37 @@ fn observe_pcm_boundary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_readiness_clears_stale_setup_error_but_not_write_uncertainty() {
+        for (pending, error, expected) in [
+            (false, ErrorCode::SetupRequired, None),
+            (
+                true,
+                ErrorCode::SetupRequired,
+                Some(ErrorCode::SetupRequired),
+            ),
+            (
+                false,
+                ErrorCode::WriteUncertain,
+                Some(ErrorCode::WriteUncertain),
+            ),
+        ] {
+            let mut snapshot = fixture().snapshot();
+            snapshot.owned_device_verified = false;
+            snapshot.control_pending = pending;
+            snapshot.control_error = Some(error);
+            snapshot.control_outcome = Some("earlier control error".into());
+            observe_device_verification(&mut snapshot, false);
+            assert_eq!(snapshot.control_error, Some(error));
+            observe_device_verification(&mut snapshot, true);
+            assert_eq!(snapshot.readiness, ServiceState::Ready);
+            assert_eq!(snapshot.control_error, expected);
+            if expected.is_none() {
+                assert!(snapshot.control_outcome.is_none());
+            }
+        }
+    }
 
     #[test]
     fn natural_track_boundary_requalifies_pcm_without_flushing_the_stream() {

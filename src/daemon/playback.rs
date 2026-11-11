@@ -327,6 +327,71 @@ fn owned(shared: &Shared) -> Result<String, IpcError> {
         })
 }
 
+fn await_owned<P>(
+    shared: &Shared,
+    mailbox: &Mailbox<P>,
+    intent: &Intent<P>,
+    timeout: Duration,
+) -> Result<String, IpcError> {
+    let deadline = Instant::now() + timeout;
+    let mut requested = false;
+    loop {
+        check(shared, mailbox, intent)?;
+        if mailbox.latest_load.load(Ordering::Acquire) > intent.id {
+            return Err(IpcError::new(
+                ErrorCode::Busy,
+                "Selection superseded before device verification",
+            ));
+        }
+        let snapshot = shared.snapshot();
+        if snapshot.soloist_ready && snapshot.owned_device_verified {
+            return owned(shared);
+        }
+        if !snapshot.web_api_ready
+            || (!snapshot.soloist_ready
+                && snapshot.readiness != crate::domain::ServiceState::Starting)
+        {
+            return Err(IpcError::new(
+                ErrorCode::SetupRequired,
+                "Playback services are unavailable; inspect daemon status before retrying",
+            ));
+        }
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(IpcError::new(ErrorCode::Timeout, "Device verification is still pending; no playback command was sent. Select again when Myx is ready"));
+        };
+        if !requested {
+            shared
+                .commands
+                .try_send(super::OwnerMessage::RetryServices)
+                .map_err(|_| {
+                    IpcError::new(
+                        ErrorCode::Busy,
+                        "Device verification request could not be queued",
+                    )
+                })?;
+            requested = true;
+            shared.update(|s| {
+                if s.control_id == intent.id {
+                    s.control_outcome = Some(
+                        "Waiting for Myx device verification; a new selection can replace this one"
+                            .into(),
+                    );
+                }
+            });
+        }
+        let snapshot = shared
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            shared
+                .changed
+                .wait_timeout(snapshot, left.min(Duration::from_millis(100)))
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+}
+
 fn api_write(
     shared: &Shared,
     mailbox: &Mailbox<Arc<RuntimePlayer>>,
@@ -542,7 +607,13 @@ fn execute(
             matches!(s.playback, PlaybackStatus::Paused | PlaybackStatus::Stopped)
         });
     }
-    let device = owned(shared)?;
+    let device = if is_load(&intent.command)
+        || matches!(intent.command, PlayerCommand::Play | PlayerCommand::Toggle)
+    {
+        await_owned(shared, mailbox, intent, Duration::from_secs(10))?
+    } else {
+        owned(shared)?
+    };
     let load = intents::plan(&intent.command).map_err(api_error)?;
     let load = load
         .map(|load| {
@@ -767,6 +838,101 @@ fn execute(
 mod tests {
     use super::*;
     const A: &str = "spotify:track:0123456789abcdefghijkl";
+
+    #[test]
+    fn early_selection_requests_verification_and_waits_without_writing() {
+        let mut shared = super::super::tests::fixture();
+        let (commands, requests) = flume::bounded(2);
+        Arc::get_mut(&mut shared).unwrap().commands = commands;
+        shared.update(|s| {
+            s.owned_device_verified = false;
+            s.readiness = crate::domain::ServiceState::SetupRequired;
+        });
+        let mailbox = Mailbox::default();
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let intent = mailbox.queue.lock().unwrap().pop_front().unwrap();
+        let state = shared.clone();
+        let verifier = std::thread::spawn(move || {
+            if matches!(
+                requests.recv_timeout(Duration::from_millis(200)),
+                Ok(super::super::OwnerMessage::RetryServices)
+            ) {
+                state.update(|s| s.owned_device_verified = true);
+                true
+            } else {
+                false
+            }
+        });
+        let result = await_owned(&shared, &mailbox, &intent, Duration::from_secs(1));
+        let requested = verifier.join().unwrap();
+        assert!(
+            requested,
+            "early Play must request the owner's verification, not activate an unverified device"
+        );
+        assert_eq!(result.unwrap(), "owned");
+        assert_eq!(shared.observations.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn verification_wait_is_bounded_and_does_not_invent_ownership() {
+        let mut shared = super::super::tests::fixture();
+        let (commands, requests) = flume::bounded(2);
+        Arc::get_mut(&mut shared).unwrap().commands = commands;
+        shared.update(|s| s.owned_device_verified = false);
+        let mailbox = Mailbox::default();
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let intent = mailbox.queue.lock().unwrap().pop_front().unwrap();
+        let result = await_owned(&shared, &mailbox, &intent, Duration::from_millis(10));
+        assert!(matches!(result, Err(error) if error.code == ErrorCode::Timeout));
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(super::super::OwnerMessage::RetryServices)
+        ));
+        assert!(requests.is_empty());
+        assert!(!shared.snapshot().owned_device_verified);
+        assert_eq!(shared.observations.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn newer_selection_cancels_pending_verification_before_any_write() {
+        let mut shared = super::super::tests::fixture();
+        let (commands, requests) = flume::bounded(2);
+        Arc::get_mut(&mut shared).unwrap().commands = commands;
+        shared.update(|s| s.owned_device_verified = false);
+        let mailbox = Arc::new(Mailbox::default());
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let intent = mailbox.queue.lock().unwrap().pop_front().unwrap();
+        let state = shared.clone();
+        let input = mailbox.clone();
+        let worker = std::thread::spawn(move || {
+            await_owned(&state, &input, &intent, Duration::from_secs(2))
+        });
+        assert!(matches!(
+            requests.recv_timeout(Duration::from_secs(1)),
+            Ok(super::super::OwnerMessage::RetryServices)
+        ));
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let result = worker.join().unwrap();
+        assert!(matches!(result, Err(error) if error.code == ErrorCode::Busy));
+        assert_eq!(shared.observations.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn failed_playback_services_do_not_queue_a_later_surprise_play() {
+        let shared = super::super::tests::fixture();
+        shared.update(|s| {
+            s.soloist_ready = false;
+            s.owned_device_verified = false;
+            s.readiness = crate::domain::ServiceState::SetupRequired;
+        });
+        let mailbox = Mailbox::default();
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let intent = mailbox.queue.lock().unwrap().pop_front().unwrap();
+        assert!(
+            matches!(await_owned(&shared, &mailbox, &intent, Duration::from_secs(1)), Err(error) if error.code == ErrorCode::SetupRequired)
+        );
+        assert_eq!(shared.observations.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn repeated_volume_target_does_not_write_or_fence_later_controls() {
