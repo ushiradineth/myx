@@ -1399,6 +1399,7 @@ fn transport(
     let mut reconnecting = false;
     let mut initial_volume = Some(volume);
     let mut diagnostics = soloist_runtime::SdkDiagnostics::default();
+    let mut last_failure = None;
     while !stop.load(Ordering::Acquire) {
         if !runtime.is_running() {
             bail!("Soloist owned runtime exited");
@@ -1547,7 +1548,8 @@ fn transport(
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            if connection_result.is_err() {
+            if let Err(error) = connection_result {
+                last_failure = Some(error);
                 audio.set_active(false);
                 session.disconnected();
                 emit(
@@ -1558,6 +1560,8 @@ fn transport(
                     },
                 );
             }
+        } else if let Err(error) = connection {
+            last_failure = Some(error);
         }
         if stop.load(Ordering::Acquire) {
             break;
@@ -1582,7 +1586,11 @@ fn transport(
             );
         }
         failures += 1;
-        ensure!(failures <= 6, "Soloist reconnect attempts exhausted");
+        if failures > 6 {
+            return Err(last_failure
+                .unwrap_or_else(|| anyhow!("Soloist control connection failed"))
+                .context("Soloist reconnect attempts exhausted"));
+        }
         let delay = Duration::from_millis((250u64 << (failures - 1)).min(4000));
         let until = Instant::now() + delay;
         while Instant::now() < until && !stop.load(Ordering::Acquire) {

@@ -117,7 +117,12 @@ fn main() -> Result<()> {
     let prepare = || -> Result<Startup> {
         let connection =
             Connection::ensure(&Config::path().context("resolve configuration path")?)?;
-        let snapshot = connection.prepare(!cli.non_interactive && !cli.headless)?;
+        let interactive = !cli.non_interactive && !cli.headless;
+        let snapshot = if cli.headless || cli.uri.is_some() || cli.volume.is_some() {
+            connection.prepare(interactive)?
+        } else {
+            connection.prepare_browse(interactive)?
+        };
         Ok(Startup {
             connection,
             snapshot,
@@ -138,20 +143,26 @@ fn main() -> Result<()> {
     }
     let (startup, mut terminal) = auth_then_terminal(prepare, init_terminal)?;
     let picker = Cover::make_picker(myx::config::get().protocol.as_deref());
-    let result = (|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .context("start tokio runtime")?;
-        runtime.block_on(boot(&mut terminal, startup, picker))
-    })();
+    let result = run_ui_runtime(boot(&mut terminal, startup, picker));
     let restored = restore_terminal(&mut terminal);
     result?;
     restored
 }
 
-// Setup must finish before the alternate screen can hide an authorization URL.
+fn run_ui_runtime(future: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .context("start tokio runtime")?;
+    let result = runtime.block_on(future);
+    // Blocking catalog/artwork requests may finish later; they must not delay
+    // restoring the terminal after the viewer has already exited.
+    runtime.shutdown_background();
+    result
+}
+
+// Authorization must finish before the alternate screen can hide its URL.
 fn auth_then_terminal<A, T, Auth, Init>(auth: Auth, init_terminal: Init) -> Result<(A, T)>
 where
     Auth: FnOnce() -> Result<A>,
@@ -360,7 +371,6 @@ async fn run_ui(
     let mut out = FrameOut::default();
     loop {
         let touched = tokio::select! {
-            biased;
             signal = shutdown.recv() => { signal?; break; },
             _ = frame.tick() => {
                 // Project the original daemon timestamp/speed on each frame.

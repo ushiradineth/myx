@@ -333,3 +333,28 @@ fn enter_label_matches_context_target() {
         assert_eq!(opens, context_target(&row).is_some() && !row.is_play());
     }
 }
+
+#[test]
+fn quitting_does_not_wait_for_an_outstanding_artwork_download() {
+    let (release, blocked) = flume::bounded::<()>(1);
+    let (finished, completion) = flume::bounded(1);
+    let worker = std::thread::spawn(move || {
+        let result = run_ui_runtime(async {
+            let (started, observed) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            });
+            observed.await.unwrap();
+            Ok(())
+        });
+        finished.send(result.is_ok()).unwrap();
+    });
+    let result = completion.recv_timeout(Duration::from_millis(500));
+    release.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(
+        result.unwrap(),
+        "UI runtime shutdown must not block terminal restoration"
+    );
+}

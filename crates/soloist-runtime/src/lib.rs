@@ -86,6 +86,15 @@ pub fn startup_diagnostic(error: &anyhow::Error) -> &'static str {
             "native libpulse unavailable" => return "Private PCM bridge could not load the native libpulse library",
             "native libpulse API unavailable" => return "Private PCM bridge could not load the required native libpulse symbols",
             "owned runtime exited before readiness" => return "Soloist SDK or its owned audio process exited before endpoint readiness",
+            "Soloist owned runtime exited" => return "Soloist SDK or its owned audio process exited; restart is required before playback",
+            "Soloist local connection failed" => return "Soloist local WebSocket listener could not be reached after bounded retries",
+            "Soloist WebSocket handshake failed" => return "Soloist local WebSocket handshake failed after bounded retries",
+            "Soloist control connection closed" => return "Soloist closed its local control connection repeatedly",
+            "Soloist command transport failed" => return "Soloist local control command could not be delivered",
+            "Soloist heartbeat transport failed" => return "Soloist local control heartbeat failed",
+            "Soloist sent an invalid JSON event" => return "Soloist sent an invalid local control event",
+            "Soloist control connection failed" => return "Soloist local control connection failed after bounded retries",
+            "Soloist did not send initial authentication state" => return "Soloist local control connected but did not supply authentication state",
             _ => {}
         }
     }
@@ -125,6 +134,24 @@ mod startup_diagnostic_tests {
         assert_eq!(
             startup_diagnostic(&anyhow::anyhow!("PRIVATE-CREDENTIAL")),
             "Soloist worker stopped after a runtime or transport failure"
+        );
+    }
+
+    #[test]
+    fn transport_failure_preserves_known_local_cause_without_exposing_unknown_details() {
+        let error = anyhow::anyhow!("Soloist WebSocket handshake failed")
+            .context("Soloist reconnect attempts exhausted")
+            .context(StartupStage::Transport);
+        assert_eq!(
+            startup_diagnostic(&error),
+            "Soloist local WebSocket handshake failed after bounded retries"
+        );
+        let secret = anyhow::anyhow!("PRIVATE-CREDENTIAL-AND-PROVIDER-DIAGNOSTIC")
+            .context("Soloist reconnect attempts exhausted")
+            .context(StartupStage::Transport);
+        assert_eq!(
+            startup_diagnostic(&secret),
+            "Soloist owned WebSocket transport failed"
         );
     }
 }

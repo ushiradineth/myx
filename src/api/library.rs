@@ -1,4 +1,4 @@
-//! Demand-driven, all-page user collections. Failed collections never publish partial rows.
+//! Demand-driven collections and first-page Home previews. Failures never publish partial rows.
 use super::*;
 use crate::*;
 
@@ -56,6 +56,31 @@ pub(crate) fn fetch_section(
     fetch_section_with(|path| get_json(connection, path), section)
 }
 
+fn home_group(
+    page: serde_json::Value,
+    title: &str,
+    parse_row: impl FnMut(&serde_json::Value) -> Option<LibItem>,
+) -> FetchResult<Vec<LibItem>> {
+    let items = page["items"].as_array().ok_or(ApiError::InvalidResponse)?;
+    let more = match page.get("next") {
+        Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(_)) => true,
+        _ => return Err(ApiError::InvalidResponse),
+    };
+    let group: Vec<_> = items.iter().filter_map(parse_row).collect();
+    if group.is_empty() {
+        return Ok(Vec::new());
+    }
+    let title = if more {
+        format!("{title} - preview")
+    } else {
+        title.into()
+    };
+    let mut rows = vec![LibItem::header(&title)];
+    rows.extend(group);
+    Ok(rows)
+}
+
 pub(crate) fn fetch_section_with(
     mut fetch: impl FnMut(&str) -> FetchResult<serde_json::Value>,
     section: Section,
@@ -65,33 +90,24 @@ pub(crate) fn fetch_section_with(
     };
     let rows = match section {
         Section::Home => {
-            let mut rows = Vec::new();
-            let recent: Vec<_> =
-                collect(&format!("{API}/me/player/recently-played?limit=50"), None)?
-                    .iter()
-                    .filter_map(|entry| track_row(&entry["track"]))
-                    .collect();
-            if !recent.is_empty() {
-                rows.push(LibItem::header("Recently Played"));
-                rows.extend(recent);
-            }
+            let mut rows = home_group(
+                fetch(&format!("{API}/me/player/recently-played?limit=50"))?,
+                "Recently Played",
+                |entry| track_row(&entry["track"]),
+            )?;
             for (title, kind) in [
                 ("Your Top Tracks", "tracks"),
                 ("Your Top Artists", "artists"),
             ] {
-                let values = collect(&format!("{API}/me/top/{kind}?limit=50"), None)?;
-                let group: Vec<_> = values
-                    .iter()
-                    .filter_map(if kind == "tracks" {
+                rows.extend(home_group(
+                    fetch(&format!("{API}/me/top/{kind}?limit=50"))?,
+                    title,
+                    if kind == "tracks" {
                         track_row
                     } else {
                         context_row
-                    })
-                    .collect();
-                if !group.is_empty() {
-                    rows.push(LibItem::header(title));
-                    rows.extend(group);
-                }
+                    },
+                )?);
             }
             rows
         }

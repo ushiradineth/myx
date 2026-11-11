@@ -130,6 +130,93 @@ fn successfully_empty_is_loaded_but_an_error_never_replaces_valid_rows() {
 }
 
 #[test]
+fn home_is_a_three_request_overview_with_explicit_preview_headers() {
+    let mut paths = Vec::new();
+    let rows = fetch_section_with(
+        |path| {
+            paths.push(path.to_owned());
+            assert!(path.ends_with("?limit=50"), "Home must not follow {path}");
+            let track = json!({"name":"Track","uri":"spotify:track:a"});
+            let (item, total) = if path.contains("recently-played") {
+                (json!({"track":track}), None)
+            } else if path.contains("/top/tracks") {
+                (track, Some(3567))
+            } else {
+                (json!({"name":"Artist","uri":"spotify:artist:a"}), Some(242))
+            };
+            Ok(json!({"items":vec![item; 50],"total":total,"next":format!("{path}&offset=50")}))
+        },
+        Section::Home,
+    )
+    .unwrap();
+    assert_eq!(paths.len(), 3);
+    assert_eq!(rows.len(), 153);
+    let headers: Vec<_> = rows
+        .iter()
+        .filter(|row| row.is_header())
+        .map(|row| row.name.as_str())
+        .collect();
+    assert_eq!(
+        headers,
+        [
+            "Recently Played - preview",
+            "Your Top Tracks - preview",
+            "Your Top Artists - preview"
+        ]
+    );
+    assert_eq!(rows.iter().filter(|row| row.is_track()).count(), 100);
+}
+
+#[test]
+fn home_terminal_groups_keep_their_labels_and_malformed_pages_fail() {
+    let rows = fetch_section_with(
+        |_| {
+            Ok(json!({"items":[{"name":"Artist","uri":"spotify:artist:a",
+            "track":{"name":"Track","uri":"spotify:track:a"}}],"next":null}))
+        },
+        Section::Home,
+    )
+    .unwrap();
+    let headers: Vec<_> = rows
+        .iter()
+        .filter(|row| row.is_header())
+        .map(|row| row.name.as_str())
+        .collect();
+    assert_eq!(
+        headers,
+        ["Recently Played", "Your Top Tracks", "Your Top Artists"]
+    );
+    for page in [
+        json!({"items":{},"next":null}),
+        json!({"items":[]}),
+        json!({"items":[],"next":true}),
+        json!({"tracks":{"items":[],"next":null}}),
+    ] {
+        assert!(matches!(
+            fetch_section_with(|_| Ok(page.clone()), Section::Home),
+            Err(ApiError::InvalidResponse)
+        ));
+    }
+}
+
+#[test]
+fn recent_section_still_follows_every_page() {
+    let mut calls = 0;
+    let rows = fetch_section_with(
+        |path| {
+            calls += 1;
+            if calls == 2 { assert!(path.ends_with("&before=1")); }
+            Ok(json!({"items":[{"track":{"name":format!("Track {calls}"),"uri":format!("spotify:track:{calls}")}}],
+                "next":if calls == 1 { Some("/v1/me/player/recently-played?limit=50&before=1") } else { None }}))
+        },
+        Section::Recent,
+    ).unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].name, "Track 2");
+}
+
+#[test]
 fn home_requests_its_recent_and_user_top_groups_without_loading_other_user_collections() {
     let mut paths = Vec::new();
     fetch_section_with(

@@ -172,6 +172,15 @@ impl Connection {
     }
 
     pub fn prepare(&self, interactive: bool) -> Result<Snapshot> {
+        self.prepare_until(interactive, true)
+    }
+
+    /// Authorize catalog browsing without waiting for native playback readiness.
+    pub fn prepare_browse(&self, interactive: bool) -> Result<Snapshot> {
+        self.prepare_until(interactive, false)
+    }
+
+    fn prepare_until(&self, interactive: bool, playback: bool) -> Result<Snapshot> {
         // Cached refresh, owned runtime readiness and device-list propagation
         // have separate bounded deadlines; they can exceed the IPC start time.
         let deadline = Instant::now() + Duration::from_secs(if interactive { 180 } else { 90 });
@@ -182,12 +191,14 @@ impl Connection {
                 true,
                 deadline.min(Instant::now() + CONTROL_TIMEOUT),
             )?)?;
-            if snapshot.soloist_ready
-                && snapshot.owned_device_verified
-                && matches!(
-                    snapshot.readiness,
-                    ServiceState::Ready | ServiceState::Degraded
-                )
+            if (!playback && snapshot.web_api_ready)
+                || (playback
+                    && snapshot.soloist_ready
+                    && snapshot.owned_device_verified
+                    && matches!(
+                        snapshot.readiness,
+                        ServiceState::Ready | ServiceState::Degraded
+                    ))
             {
                 return Ok(snapshot);
             }
@@ -643,6 +654,86 @@ impl Drop for DetachedChild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browse_attaches_before_native_setup_or_device_verification() {
+        for (state, soloist_ready) in [
+            (ServiceState::SetupRequired, false),
+            (ServiceState::Starting, false),
+            (ServiceState::Starting, true),
+            (ServiceState::Degraded, true),
+            (ServiceState::Error, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = RuntimePaths::in_directory(root.path().canonicalize().unwrap().join("ipc"));
+            let config = PathBuf::from("/test/config");
+            let mut snapshot =
+                Snapshot::starting(config.to_string_lossy().into_owned(), "myx".into());
+            snapshot.web_api_ready = true;
+            snapshot.soloist_ready = soloist_ready;
+            snapshot.readiness = state;
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = calls.clone();
+            let _server = crate::daemon::server::Server::bind(
+                paths.clone(),
+                config.to_string_lossy().into_owned(),
+                std::sync::Arc::new(move |request| {
+                    assert!(matches!(request, Operation::Status));
+                    let mut snapshot = snapshot.clone();
+                    if received.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                        snapshot.readiness = ServiceState::Error;
+                    }
+                    Ok(Payload::Snapshot(Box::new(snapshot)))
+                }),
+            )
+            .unwrap();
+            let connection = Connection { paths, config };
+            let attached = connection
+                .prepare_browse(false)
+                .expect("catalog-ready viewers must not wait for native playback");
+            assert!(attached.web_api_ready);
+            assert!(!attached.owned_device_verified);
+            assert_eq!(attached.soloist_ready, soloist_ready);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn browse_still_requires_authorization_and_playback_still_requires_native_readiness() {
+        for (browse, web_api_ready) in [(true, false), (false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = RuntimePaths::in_directory(root.path().canonicalize().unwrap().join("ipc"));
+            let config = PathBuf::from("/test/config");
+            let mut snapshot =
+                Snapshot::starting(config.to_string_lossy().into_owned(), "myx".into());
+            snapshot.readiness = ServiceState::SetupRequired;
+            snapshot.web_api_ready = web_api_ready;
+            let _server = crate::daemon::server::Server::bind(
+                paths.clone(),
+                config.to_string_lossy().into_owned(),
+                std::sync::Arc::new(move |operation| {
+                    assert!(matches!(operation, Operation::Status));
+                    Ok(Payload::Snapshot(Box::new(snapshot.clone())))
+                }),
+            )
+            .unwrap();
+            let connection = Connection { paths, config };
+            let result = if browse {
+                connection.prepare_browse(false)
+            } else {
+                connection.prepare(false)
+            };
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if browse {
+                    "authorization requires setup"
+                } else {
+                    "Soloist runtime is unavailable"
+                }),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn completed_reply_is_readable_after_the_server_closes_its_socket() {

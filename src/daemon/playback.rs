@@ -135,10 +135,9 @@ fn run_worker<P>(
         };
         if matches!(intent.command, PlayerCommand::Stop) && matches!(result, Ok(true)) {
             unsettled = false;
-        } else if (!matches!(intent.command, PlayerCommand::Queue) && matches!(result, Ok(false)))
-            || result
-                .as_ref()
-                .is_err_and(|e| e.code == ErrorCode::WriteUncertain)
+        } else if result
+            .as_ref()
+            .is_err_and(|e| e.code == ErrorCode::WriteUncertain)
         {
             unsettled = true;
         }
@@ -153,12 +152,12 @@ fn run_worker<P>(
             match result {
                 Ok(observed) => {
                     if !observed && !matches!(intent.command, PlayerCommand::Queue) {
-                        s.control_error = Some(ErrorCode::WriteUncertain);
+                        s.control_error = Some(ErrorCode::Timeout);
                     }
                     s.control_outcome = Some(if observed {
                         "Matching native state observed (not load/offset qualification)".into()
                     } else {
-                        "Write accepted; playback/options remain unconfirmed by observations".into()
+                        "Command sent; matching state was not observed in time. A new selection can replace it".into()
                     });
                 }
                 Err(error) => {
@@ -346,7 +345,7 @@ fn api_write(
 
 fn wait<P>(
     shared: &Shared,
-    _mailbox: &Mailbox<P>,
+    mailbox: &Mailbox<P>,
     intent: &Intent<P>,
     after: u64,
     predicate: impl Fn(&Snapshot) -> bool,
@@ -357,14 +356,23 @@ fn wait<P>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
-        // Once a write is submitted, a newer load cannot cancel its ordering
-        // fence. Only shutdown/account replacement may abandon the observation.
+        // Delivery uncertainty is handled by the write itself, not this wait.
+        // A new absolute selection may replace an accepted command's observation
+        // wait, but Stop reconciliation remains an ordering barrier.
         if shared.shutdown.load(Ordering::Acquire)
             || shared.generation.load(Ordering::Acquire) != intent.generation
         {
             return Err(IpcError::new(
                 ErrorCode::WriteUncertain,
                 "Write observation interrupted; reconcile before retrying",
+            ));
+        }
+        if !matches!(intent.command, PlayerCommand::Stop)
+            && mailbox.latest_load.load(Ordering::Acquire) > intent.id
+        {
+            return Err(IpcError::new(
+                ErrorCode::Busy,
+                "Command observation superseded by a newer selection",
             ));
         }
         if shared.observations.load(Ordering::Acquire) > after && predicate(&snapshot) {
@@ -994,6 +1002,71 @@ mod tests {
         assert_eq!(shared.snapshot().playback, PlaybackStatus::Paused);
         assert_eq!(shared.snapshot().position.speed, 0.0);
         assert!(!shared.snapshot().control_pending);
+    }
+
+    #[test]
+    fn observation_timeout_does_not_fence_a_new_explicit_selection() {
+        let shared = super::super::tests::fixture();
+        let mailbox = Arc::new(Mailbox::default());
+        mailbox.enqueue(&shared, (), PlayerCommand::Pause).unwrap();
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let (sent, received) = flume::unbounded();
+        let state = shared.clone();
+        let input = mailbox.clone();
+        let worker = std::thread::spawn(move || {
+            run_worker(state, input, |state, _, intent| {
+                sent.send(intent.id).unwrap();
+                if intent.id == 2 {
+                    state.shutdown.store(true, Ordering::Release);
+                }
+                Ok(false)
+            });
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        let second = received.recv_timeout(Duration::from_millis(500));
+        shared.shutdown.store(true, Ordering::Release);
+        mailbox.changed.notify_all();
+        worker.join().unwrap();
+        assert_eq!(
+            second.unwrap(),
+            2,
+            "a missing observation is not ambiguous delivery"
+        );
+        assert_eq!(shared.snapshot().control_error, Some(ErrorCode::Timeout));
+    }
+
+    #[test]
+    fn newer_selection_supersedes_an_old_observation_wait_without_replaying_it() {
+        let shared = super::super::tests::fixture();
+        let mailbox = Arc::new(Mailbox::default());
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let (sent, received) = flume::unbounded();
+        let state = shared.clone();
+        let input = mailbox.clone();
+        let worker = std::thread::spawn(move || {
+            run_worker(state, input, |state, input, intent| {
+                sent.send(intent.id).unwrap();
+                if intent.id == 1 {
+                    wait(state, input, intent, 0, |_| false)
+                } else {
+                    state.shutdown.store(true, Ordering::Release);
+                    Ok(true)
+                }
+            });
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        mailbox.enqueue(&shared, (), liked()).unwrap();
+        let second = received.recv_timeout(Duration::from_millis(500));
+        shared.shutdown.store(true, Ordering::Release);
+        mailbox.changed.notify_all();
+        shared.changed.notify_all();
+        worker.join().unwrap();
+        assert_eq!(
+            second.unwrap(),
+            2,
+            "new selection must not wait for the five-second observation deadline"
+        );
+        assert_eq!(shared.snapshot().control_error, None);
     }
 
     #[test]
