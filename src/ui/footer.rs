@@ -1,68 +1,88 @@
-//! The one-line keybinding hint footer.
+//! Key hints grouped by navigation and playback, in their keyboard order.
 
 use crate::*;
 
 pub(crate) fn render_footer(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
-    let on = |b: bool| if b { theme.success } else { theme.text_muted };
-    let key = |k: &'static str| Span::styled(k, Style::default().fg(theme.primary.into()));
-    let lbl = |t: &'static str| Span::styled(t, theme.muted());
-    let enter_lbl = enter_label(app.cur_items().get(app.browse.selected));
-    let play_lbl = if app.playback.now.as_ref().is_some_and(|n| n.is_playing) {
-        " pause   "
+    let enter = if app.home_groups_visible()
+        && app
+            .cur_items()
+            .get(app.browse.selected)
+            .is_some_and(LibItem::is_header)
+    {
+        if app.browse.library.home_group_expanded(app.browse.selected) {
+            "fold"
+        } else {
+            "expand"
+        }
     } else {
-        " play    "
+        enter_label(app.cur_items().get(app.browse.selected))
     };
-    // Flagged hints go with the library pane, which zen hides — a key that does
-    // nothing must not be advertised.
-    let hints = [
-        (true, key("⇥"), lbl(" section   ")),
-        (false, key("←→"), lbl(" view   ")),
-        (true, key("/"), lbl(" search   ")),
+    let waveform = if app.view.waveform_visible {
+        "waveform on"
+    } else {
+        "waveform off"
+    };
+    let mut navigation = Vec::new();
+    if !app.view.zen {
+        navigation.push(("←→", "section"));
+    }
+    navigation.extend([("⇥/⇧⇥", "view"), ("v", waveform), ("z", "zen")]);
+    if !app.view.zen {
+        navigation.extend([
+            ("↑↓", "move"),
+            ("⏎", enter),
+            ("P", "play context"),
+            ("/", "search"),
+            ("a", "actions"),
+            ("r", "reload"),
+            ("Esc", "back"),
+        ]);
+        if !app.home_groups_visible() {
+            navigation.push(("o", "sort"));
+        }
+    } else {
+        navigation.push(("a", "actions"));
+    }
+    let playback = vec![
+        ("␣", "play/pause"),
+        ("n/b", "skip"),
         (
-            true,
-            key("⏎"),
-            Span::styled(format!(" {enter_lbl}   "), theme.muted()),
-        ),
-        (true, key("⇧⏎"), lbl(" play   ")),
-        (true, key("S"), lbl(" shuffle   ")),
-        (false, key("␣"), Span::styled(play_lbl, theme.muted())),
-        (false, key("n/b"), lbl(" skip   ")),
-        (false, key("⇧←→"), lbl(" seek   ")),
-        (true, key("o"), lbl(" sort   ")),
-        (false, key("+/-"), lbl(" vol   ")),
-        (
-            false,
-            Span::styled("s", Style::default().fg(on(app.transport.shuffle).into())),
-            lbl(" shuffle   "),
+            "S",
+            if app.transport.shuffle {
+                "shuffle on"
+            } else {
+                "shuffle off"
+            },
         ),
         (
-            false,
-            Span::styled(
-                "R",
-                Style::default().fg(on(app.transport.repeat != RepeatMode::Off).into()),
-            ),
-            lbl(match app.transport.repeat {
-                RepeatMode::Off => " repeat off   ",
-                RepeatMode::One => " repeat one   ",
-                RepeatMode::All => " repeat all   ",
-            }),
+            "R",
+            match app.transport.repeat {
+                RepeatMode::Off => "repeat off",
+                RepeatMode::One => "repeat one",
+                RepeatMode::All => "repeat all",
+            },
         ),
-        (false, key("a"), lbl(" actions   ")),
-        (false, key("e"), lbl(" eq   ")),
-        (
-            false,
-            Span::styled("z", Style::default().fg(on(app.view.zen).into())),
-            lbl(" zen   "),
-        ),
-        (false, key("q"), lbl(" quit")),
+        ("⇧←→", "seek"),
+        ("+/-", "vol"),
+        ("e", "eq"),
+        ("q", "quit"),
     ];
-    let mut spans = Vec::new();
-    spans.extend(
-        hints
-            .into_iter()
-            .filter(|(needs_library, ..)| !needs_library || !app.view.zen)
-            .flat_map(|(_, k, label)| [k, label]),
-    );
-    let line = Line::from(spans);
-    f.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
+    let lines: Vec<Line> = [navigation, playback]
+        .into_iter()
+        .map(|hints| {
+            let mut spans = Vec::new();
+            let mut used = 0;
+            for (key, label) in hints {
+                let width = Line::from(format!("{key} {label}  ")).width();
+                if used + width > area.width as usize {
+                    continue;
+                }
+                used += width;
+                spans.push(Span::styled(key, Style::default().fg(theme.primary.into())));
+                spans.push(Span::styled(format!(" {label}  "), theme.muted()));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }

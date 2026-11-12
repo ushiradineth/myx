@@ -25,6 +25,11 @@ pub(crate) use visualizer::*;
 use crate::*;
 
 pub(crate) fn render(f: &mut Frame, app: &App, out: &mut FrameOut, repaint: ArtRepaint) {
+    if repaint == ArtRepaint::Wipe {
+        if let Some(previous) = out.art {
+            wipe_area(f, previous.intersection(f.area()));
+        }
+    }
     out.art = None;
     out.spectrum = None;
     let theme = app.theme.displayed;
@@ -33,91 +38,47 @@ pub(crate) fn render(f: &mut Frame, app: &App, out: &mut FrameOut, repaint: ArtR
     let area = area.inner(Margin::new(2, 1));
 
     let rows = Layout::vertical([
-        Constraint::Length(1), // header
-        Constraint::Length(1), // spacer
         Constraint::Min(6),    // body (library | active view)
         Constraint::Length(1), // spacer
         Constraint::Length(2), // now-playing strip
-        Constraint::Length(1), // footer
+        Constraint::Length(2), // footer
     ])
     .split(area);
-
-    // Header: wordmark + view tabs (right-aligned) + status.
-    // Fullwidth wordmark (each letter = 2 cells) reads as a bigger "myx"
-    // than the terminal font allows on a single row; bolded for weight.
-    let mut header: Vec<Span> =
-        gradient_line("\u{FF2D}\u{FF39}\u{FF38}", &[theme.primary, theme.accent])
-            .into_iter()
-            .map(|mut sp| {
-                sp.style = sp.style.add_modifier(Modifier::BOLD);
-                sp
-            })
-            .collect();
-    if !app.status.is_empty() {
-        header.push(Span::styled(format!("   {}", app.status), theme.muted()));
-    }
-    if app.session.mutation_uncertain {
-        header.push(Span::styled(
-            "   previous library write unconfirmed",
-            theme.muted(),
-        ));
-    }
-    f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
-    f.render_widget(
-        Paragraph::new(Line::from(view_tabs(app, theme))).alignment(Alignment::Right),
-        rows[0],
-    );
-    // Per-tab hit rects for the mouse (mirrors view_tabs: "\u2190\u2192 " prefix + labels joined by " \u00b7 ").
-    let mut total: usize = 3; // "\u2190\u2192 "
-    for (i, v) in RightView::ALL.iter().enumerate() {
-        if i > 0 {
-            total += 3;
-        } // " \u00b7 "
-        total += v.label().chars().count();
-    }
-    let mut tx_x = rows[0]
-        .right()
-        .saturating_sub(total as u16)
-        .saturating_add(3);
-    let mut tabs = Vec::with_capacity(RightView::ALL.len());
-    for (i, v) in RightView::ALL.iter().enumerate() {
-        if i > 0 {
-            tx_x = tx_x.saturating_add(3);
-        }
-        let w = v.label().chars().count() as u16;
-        tabs.push((
-            *v,
-            Rect {
-                x: tx_x,
-                y: rows[0].y,
-                width: w,
-                height: 1,
-            },
-        ));
-        tx_x = tx_x.saturating_add(w);
-    }
-    out.hits.tabs = tabs;
 
     let right = if app.view.zen {
         // Hidden, not zero-width: a rendered sidebar still claims mouse rects.
         out.hits.lib = None;
         out.hits.scroll = None;
-        rows[2]
+        rows[0]
     } else {
         let body = Layout::horizontal([Constraint::Percentage(30), Constraint::Min(24)])
             .spacing(3)
-            .split(rows[2]);
+            .split(rows[0]);
         render_library(f, app, out, theme, body[0]);
         body[1]
     };
+    let right_rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(right);
+    render_view_header(f, app.view.mode, out, theme, right_rows[0]);
+    let status = if app.session.mutation_uncertain {
+        format!("{} · previous library write unconfirmed", app.status)
+    } else {
+        app.status.clone()
+    };
+    f.render_widget(Paragraph::new(status).style(theme.muted()), right_rows[1]);
+    let right = right_rows[2];
     match app.view.mode {
         RightView::NowPlaying => render_nowplaying_view(f, app, out, theme, right, repaint),
         RightView::Lyrics => render_lyrics(f, app, theme, right),
         RightView::Queue => render_queue_view(f, app, theme, right),
     }
 
-    render_now_strip(f, app, out, theme, rows[4]);
-    render_footer(f, app, theme, rows[5]);
+    render_now_strip(f, app, out, theme, rows[2]);
+    render_footer(f, app, theme, rows[3]);
 
     if app.view.actions.is_some() {
         render_actions_overlay(f, app, theme, area);
@@ -128,23 +89,64 @@ pub(crate) fn render(f: &mut Frame, app: &App, out: &mut FrameOut, repaint: ArtR
     }
 }
 
-/// The `Now Playing · Lyrics · Visualizer` indicator, active one lit.
-pub(crate) fn view_tabs<'a>(app: &App, theme: Theme) -> Vec<Span<'a>> {
-    let mut spans = vec![Span::styled("←→ ", theme.muted())];
-    for (i, v) in RightView::ALL.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", theme.muted()));
+pub(crate) fn render_view_header(
+    f: &mut Frame,
+    mode: RightView,
+    out: &mut FrameOut,
+    theme: Theme,
+    area: Rect,
+) {
+    out.hits.tabs.clear();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let full_width: usize = RightView::ALL
+        .iter()
+        .map(|v| v.label().len())
+        .sum::<usize>()
+        + 6;
+    let compact = (area.width as usize) < full_width;
+    let labels = if compact {
+        ["Playing", "Lyrics", "Queue"]
+    } else {
+        ["Now Playing", "Lyrics", "Queue"]
+    };
+    let total = labels.iter().map(|label| label.len()).sum::<usize>() + 6;
+    let mut x = area.x;
+    // Extremely narrow panes show only the active tab; no invisible hit targets.
+    for (index, view) in RightView::ALL.iter().enumerate() {
+        if total > area.width as usize && *view != mode {
+            continue;
         }
-        let style = if *v == app.view.mode {
-            Style::default()
-                .fg(theme.primary.into())
-                .add_modifier(Modifier::BOLD)
+        if x > area.x {
+            x = x.saturating_add(3);
+        }
+        let width = (labels[index].len() as u16).min(area.right().saturating_sub(x));
+        if width == 0 {
+            continue;
+        }
+        let rect = Rect::new(x, area.y, width, area.height.min(1));
+        let style = if *view == mode {
+            theme.heading()
         } else {
             theme.muted()
         };
-        spans.push(Span::styled(v.label(), style));
+        f.render_widget(Paragraph::new(labels[index]).style(style), rect);
+        out.hits.tabs.push((*view, rect));
+        x = x.saturating_add(width);
     }
-    spans
+}
+
+pub(crate) fn spectrum_demand(
+    visible: bool,
+    mode: RightView,
+    overlay: bool,
+    footprint: Option<Rect>,
+) -> bool {
+    visible
+        && mode == RightView::NowPlaying
+        && !overlay
+        && footprint.is_some_and(|rect| rect.width > 0 && rect.height > 0)
 }
 
 /// Where the list viewport starts, given where it started last frame.

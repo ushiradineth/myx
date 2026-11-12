@@ -3,6 +3,15 @@
 use super::*;
 use crate::*;
 
+pub(crate) fn nowplaying_regions(area: Rect, waveform_visible: bool) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Min(6),
+        Constraint::Length(if waveform_visible { 7 } else { 0 }),
+        Constraint::Length(if waveform_visible { 2 } else { 0 }),
+    ])
+    .areas::<3>(area)
+}
+
 /// View ①: album art with track details directly beneath — centered as a group.
 pub(crate) fn render_nowplaying_view(
     f: &mut Frame,
@@ -24,17 +33,12 @@ pub(crate) fn render_nowplaying_view(
 
     // Split: album art + track info on top, a compact spectrum below, lifted a
     // little off the bottom.
-    let chunks = Layout::vertical([
-        Constraint::Min(6),    // art + text
-        Constraint::Length(7), // spectrum
-        Constraint::Length(2), // breathing room (lifts the spectrum up)
-    ])
-    .split(area);
+    let chunks = nowplaying_regions(area, app.view.waveform_visible);
     let top = chunks[0];
     // Push the art + info group down a little from the top.
     let top = Rect {
         x: top.x,
-        y: top.y + 3,
+        y: top.y + top.height.min(3),
         width: top.width,
         height: top.height.saturating_sub(3),
     };
@@ -48,7 +52,7 @@ pub(crate) fn render_nowplaying_view(
 
     // Reserve 3 rows for text (+1 gap). Cap the art so the group stays compact.
     let avail_h = top.height.saturating_sub(4);
-    let mut art_h = avail_h.clamp(3, 14);
+    let mut art_h = avail_h.min(14);
     // Square image width in cells for this height: w = h * fh / fw.
     let mut art_w = (art_h as u32 * fh / fw) as u16;
     if art_w > top.width {
@@ -65,7 +69,9 @@ pub(crate) fn render_nowplaying_view(
         width: art_w,
         height: art_h,
     };
-    out.art = Some(art_rect);
+    if art_rect.width > 0 && art_rect.height > 0 {
+        out.art = Some(art_rect);
+    }
 
     let cover = app
         .playback
@@ -73,7 +79,9 @@ pub(crate) fn render_nowplaying_view(
         .as_ref()
         .and_then(|n| n.cover.as_ref())
         .or(app.session.transition_cover.as_ref());
-    render_cover(f, cover, art_rect, repaint);
+    if out.art.is_some() {
+        render_cover(f, cover, art_rect, repaint);
+    }
 
     if let Some(n) = app.playback.now.as_ref() {
         let text_rect = Rect {
@@ -104,7 +112,7 @@ pub(crate) fn render_nowplaying_view(
         );
     }
 
-    if viz_area.width > 0 && viz_area.height > 0 {
+    if app.view.waveform_visible && viz_area.width > 0 && viz_area.height > 0 {
         out.spectrum = Some(viz_area);
         render_visualizer(f, app, theme, viz_area);
     }

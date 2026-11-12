@@ -67,7 +67,7 @@ pub(crate) fn build_action_menu(
                 if saved {
                     "Remove from Liked"
                 } else {
-                    "Add to Liked"
+                    "♥ Add to Liked"
                 },
                 ActionKind::ToggleLike {
                     id: id.clone(),

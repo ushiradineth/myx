@@ -894,7 +894,8 @@ async fn owner(shared: Arc<Shared>, commands: flume::Receiver<OwnerMessage>) -> 
             && !verifying.load(Ordering::Acquire)
         {
             if let Some(id) = player.as_ref().and_then(|player| player.device_id().ok()) {
-                next_verification = Instant::now() + Duration::from_secs(30);
+                next_verification =
+                    Instant::now() + verification_retry_delay(snapshot.control_pending);
                 verify_device(shared.clone(), verifying.clone(), id);
             }
         }
@@ -972,6 +973,10 @@ fn verify_device(shared: Arc<Shared>, pending: Arc<AtomicBool>, id: String) {
         });
         pending.store(false, Ordering::Release);
     });
+}
+
+fn verification_retry_delay(control_pending: bool) -> Duration {
+    Duration::from_secs(if control_pending { 2 } else { 30 })
 }
 
 fn observe_device_verification(snapshot: &mut Snapshot, verified: bool) {
@@ -1246,6 +1251,20 @@ fn observe_pcm_boundary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_play_gets_a_verification_retry_within_its_wait_budget() {
+        let wait_budget = Duration::from_secs(10);
+        let active_retry = verification_retry_delay(true);
+        assert!(active_retry > Duration::ZERO);
+        assert!(active_retry < wait_budget);
+        assert!(verification_retry_delay(false) > wait_budget);
+        let attempts = wait_budget.as_millis() / active_retry.as_millis();
+        assert!(
+            attempts <= 5,
+            "a pending selection must not create a tight API polling loop"
+        );
+    }
 
     #[test]
     fn verified_readiness_clears_stale_setup_error_but_not_write_uncertainty() {

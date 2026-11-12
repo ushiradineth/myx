@@ -67,17 +67,28 @@ TUI detaches the client; use `daemon stop` to stop its owner. See
 
 | Key | Action |
 | --- | --- |
-| Tab / `[` / `]` | Switch section |
-| Arrows / `j` / `k` | Navigate |
-| Enter | Play or open |
+| Left / Right / `[` / `]` | Switch library section |
+| Tab / Shift+Tab | Switch Now Playing, Lyrics and Queue views |
+| Up / Down / `j` / `k` | Navigate rows |
+| Enter | Play, open, or fold a Home group |
 | Shift+Enter / `P` | Play highlighted source |
 | `/` / `a` | Search / actions |
 | Space / `n` / `b` | Pause or play / next / previous |
 | Shift+Left / Shift+Right | Seek |
-| `s` / `R` | Shuffle / repeat |
+| `S` / `R` | Shuffle / repeat |
 | `+` / `-` / `e` | Volume / equalizer |
+| `v` | Show or hide the waveform |
 | `T` / `z` | Transparent background / sidebar |
 | `q` | Detach TUI |
+
+Home groups initially show five rows. Select a group heading and press Enter, or
+click it, to expand or fold its fetched rows. Individual songs in Home, Recent
+and Liked play the selected URI directly; use **Play Liked Songs** for the whole
+Liked collection. Album and playlist selections retain their native context.
+
+Spotify can restrict the artist Popular endpoint for an app. Myx reports that
+restriction and retains the available discography instead of substituting search
+results or inventing a popularity order.
 
 Album art, reactive colors, lyrics and a post-EQ spectrum belong to the client
 view. The daemon processes PCM even without a TUI or spectrum subscriber. Terminal

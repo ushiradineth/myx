@@ -130,7 +130,7 @@ fn successfully_empty_is_loaded_but_an_error_never_replaces_valid_rows() {
 }
 
 #[test]
-fn home_is_a_three_request_overview_with_explicit_preview_headers() {
+fn home_is_a_three_request_overview_with_group_headers() {
     let mut paths = Vec::new();
     let rows = fetch_section_with(
         |path| {
@@ -158,11 +158,7 @@ fn home_is_a_three_request_overview_with_explicit_preview_headers() {
         .collect();
     assert_eq!(
         headers,
-        [
-            "Recently Played - preview",
-            "Your Top Tracks - preview",
-            "Your Top Artists - preview"
-        ]
+        ["Recently Played", "Your Top Tracks", "Your Top Artists"]
     );
     assert_eq!(rows.iter().filter(|row| row.is_track()).count(), 100);
 }
@@ -784,6 +780,7 @@ fn authority_views(snapshot: &Snapshot) -> (SessionState, BrowseState, SearchSta
     let view = ViewState {
         mode: RightView::Lyrics,
         zen: true,
+        waveform_visible: true,
         lyrics: vec![(0, "old lyrics".into())],
         lyrics_synced: true,
         actions: Some(ActionMenu {

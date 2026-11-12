@@ -234,10 +234,8 @@ impl ApiClient {
                         error = ApiError::Quota;
                     }
                 }
-                if matches!(error, ApiError::Unauthorized | ApiError::Restricted) {
-                    self.cache.invalidate();
-                }
                 if error == ApiError::Unauthorized {
+                    self.cache.invalidate();
                     self.auth.invalidate_access();
                 }
                 self.cooldown.record(&error, retry_after, Instant::now());

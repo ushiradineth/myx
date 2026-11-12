@@ -167,6 +167,7 @@ pub(crate) struct ViewState {
     pub(crate) mode: RightView,
     // Sidebar hidden, so the right view (and its cover) gets the whole width.
     pub(crate) zen: bool,
+    pub(crate) waveform_visible: bool,
     // Lyrics: (timestamp_ms, line). Synced when timestamps are non-zero.
     pub(crate) lyrics: Vec<(u32, String)>,
     pub(crate) lyrics_synced: bool,

@@ -160,8 +160,8 @@ fn a_scrub_cannot_leave_the_track() {
 #[test]
 fn zen_ignores_the_keys_that_only_move_the_hidden_library() {
     for code in [
-        KeyCode::Tab,
-        KeyCode::BackTab,
+        KeyCode::Left,
+        KeyCode::Right,
         KeyCode::Up,
         KeyCode::Down,
         KeyCode::Enter,
@@ -179,11 +179,12 @@ fn zen_keeps_playback_and_the_right_hand_pane() {
         KeyCode::Char(' '),
         KeyCode::Char('n'),
         KeyCode::Char('b'),
-        KeyCode::Char('s'),
+        KeyCode::Char('S'),
+        KeyCode::Char('v'),
         KeyCode::Char('z'),
         KeyCode::Char('q'),
-        KeyCode::Left,
-        KeyCode::Right,
+        KeyCode::Tab,
+        KeyCode::BackTab,
         // Retargets onto the playing track rather than going quiet.
         KeyCode::Char('a'),
     ] {

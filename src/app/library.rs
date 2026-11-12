@@ -70,7 +70,7 @@ impl Section {
 pub(crate) enum ItemKind {
     /// A playable track (song / episode).
     Track,
-    /// A non-selectable section label (e.g. "Popular", "Albums").
+    /// A section label; Home labels are selectable disclosure controls.
     Header,
     /// A synthetic "▶︎ Play …" row that plays its URI as a context.
     Play,
@@ -79,7 +79,7 @@ pub(crate) enum ItemKind {
 }
 
 /// A library entry. Behavior on Enter is driven by the `kind` field:
-/// Header = non-selectable label; Track = play as a track list; Play = play this
+/// Header = label or Home disclosure; Track = play as a track list; Play = play this
 /// URI as a context; Context = open (drill into) this context.
 #[derive(Clone)]
 pub(crate) struct LibItem {
@@ -186,6 +186,11 @@ pub(crate) fn sort_list(items: &mut [LibItem], mode: SortMode) {
         .take_while(|i| i.is_header() || i.is_play())
         .count();
     let tail = &mut items[pin..];
+    // Grouped feeds keep their source groups intact rather than sorting headers
+    // into the rows. Their disclosure projection follows that same source order.
+    if tail.iter().any(LibItem::is_header) {
+        return;
+    }
     match mode {
         SortMode::Added => tail.sort_by_key(|i| i.order),
         SortMode::Title => tail.sort_by_key(|i| i.name.to_lowercase()),
@@ -222,12 +227,14 @@ pub(crate) struct Library {
     loaded: std::collections::HashSet<Section>,
     requests: std::collections::HashMap<Section, super::RequestGate>,
     errors: std::collections::HashMap<Section, crate::api::ApiError>,
+    home_visible: Vec<LibItem>,
+    home_expanded: std::collections::HashSet<usize>,
 }
 
 impl Library {
     pub(crate) fn items(&self, s: Section) -> &[LibItem] {
         match s {
-            Section::Home => &self.home,
+            Section::Home => &self.home_visible,
             Section::Recent => &self.recent,
             Section::Playlists => &self.playlists,
             Section::Liked => &self.liked,
@@ -245,17 +252,72 @@ impl Library {
             Section::Artists => &mut self.artists,
         }
     }
-    pub(crate) fn set(&mut self, s: Section, items: Vec<LibItem>) {
+    pub(crate) fn set(&mut self, s: Section, mut items: Vec<LibItem>) {
+        for (index, item) in items.iter_mut().enumerate() {
+            item.order = index as u32;
+        }
         self.errors.remove(&s);
         self.loaded.insert(s);
         match s {
-            Section::Home => self.home = items,
+            Section::Home => {
+                self.home = items;
+                self.home_expanded.clear();
+                self.rebuild_home();
+            }
             Section::Recent => self.recent = items,
             Section::Playlists => self.playlists = items,
             Section::Liked => self.liked = items,
             Section::Albums => self.albums = items,
             Section::Artists => self.artists = items,
         }
+    }
+
+    fn rebuild_home(&mut self) {
+        self.home_visible.clear();
+        let mut group = 0;
+        let mut count = 0;
+        for (index, item) in self.home.iter().enumerate() {
+            if item.is_header() {
+                group = index;
+                count = 0;
+            } else {
+                count += 1;
+            }
+            if item.is_header() || count <= 5 || self.home_expanded.contains(&group) {
+                self.home_visible.push(item.clone());
+            }
+        }
+    }
+
+    pub(crate) fn home_group_expanded(&self, visible_index: usize) -> bool {
+        self.home_source_header(visible_index)
+            .is_some_and(|index| self.home_expanded.contains(&index))
+    }
+
+    fn home_source_header(&self, visible_index: usize) -> Option<usize> {
+        if !self.home_visible.get(visible_index)?.is_header() {
+            return None;
+        }
+        let ordinal = self.home_visible[..visible_index]
+            .iter()
+            .filter(|item| item.is_header())
+            .count();
+        self.home
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.is_header())
+            .nth(ordinal)
+            .map(|(index, _)| index)
+    }
+
+    pub(crate) fn toggle_home_group(&mut self, visible_index: usize) {
+        let Some(index) = self.home_source_header(visible_index) else {
+            return;
+        };
+        if !self.home_expanded.remove(&index) {
+            self.home_expanded.insert(index);
+        }
+        self.rebuild_home();
     }
 
     /// Has this section received a delivery since boot / the last refresh?
@@ -276,6 +338,8 @@ impl Library {
     /// from the old account, including sections that are currently hidden.
     pub(crate) fn clear_authority(&mut self) {
         self.invalidate();
+        self.home_visible.clear();
+        self.home_expanded.clear();
         for section in Section::ALL {
             self.items_mut(section).clear();
         }

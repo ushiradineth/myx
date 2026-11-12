@@ -149,7 +149,7 @@ impl Player {
         }
     }
 
-    fn command(&self, command: PlayerCommand) -> Result<()> {
+    pub fn command(&self, command: PlayerCommand) -> Result<()> {
         accepted(
             self.connection
                 .request(Operation::Player(command), CONTROL_TIMEOUT)?,

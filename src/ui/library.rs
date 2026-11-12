@@ -10,6 +10,8 @@ pub(crate) fn render_library(
     theme: Theme,
     area: Rect,
 ) {
+    out.hits.lib = None;
+    out.hits.scroll = None;
     f.render_widget(Block::default().style(theme.panel()), area);
     let inner = area.inner(Margin::new(2, 1));
     if inner.height < 2 {
@@ -168,16 +170,30 @@ pub(crate) fn render_library(
             height: 1,
         };
 
-        // Header rows: a bold section label (Home feed groups), not selectable.
+        // Home headers disclose the already-loaded group; detail headers stay labels.
         if item.is_header() {
+            let disclosure = if app.home_groups_visible() {
+                if app.browse.library.home_group_expanded(idx) {
+                    "▾ "
+                } else {
+                    "▸ "
+                }
+            } else {
+                ""
+            };
+            let selected = app.home_groups_visible() && idx == app.browse.selected;
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    item.name.clone(),
+                    format!("{disclosure}{}", item.name),
                     Style::default()
                         .fg(theme.accent.into())
                         .add_modifier(Modifier::BOLD),
                 )))
-                .block(Block::default().style(theme.panel())),
+                .block(Block::default().style(if selected {
+                    theme.element()
+                } else {
+                    theme.panel()
+                })),
                 rect,
             );
             continue;

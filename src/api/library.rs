@@ -62,7 +62,7 @@ fn home_group(
     parse_row: impl FnMut(&serde_json::Value) -> Option<LibItem>,
 ) -> FetchResult<Vec<LibItem>> {
     let items = page["items"].as_array().ok_or(ApiError::InvalidResponse)?;
-    let more = match page.get("next") {
+    match page.get("next") {
         Some(serde_json::Value::Null) => false,
         Some(serde_json::Value::String(_)) => true,
         _ => return Err(ApiError::InvalidResponse),
@@ -71,12 +71,7 @@ fn home_group(
     if group.is_empty() {
         return Ok(Vec::new());
     }
-    let title = if more {
-        format!("{title} - preview")
-    } else {
-        title.into()
-    };
-    let mut rows = vec![LibItem::header(&title)];
+    let mut rows = vec![LibItem::header(title)];
     rows.extend(group);
     Ok(rows)
 }

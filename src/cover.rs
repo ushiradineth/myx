@@ -1,6 +1,6 @@
 //! Album-art rendering via `ratatui-image`.
 //!
-//! Auto-detects the terminal's graphics protocol (kitty / sixel / iTerm2) at
+//! Detects the terminal's graphics protocol (kitty / sixel / iTerm2) at
 //! startup and falls back to unicode half-blocks so *something* always renders.
 //! The encoded protocol is cached per render area — re-encoding only happens when
 //! the cover box changes size, keeping the render loop cheap.
@@ -15,7 +15,7 @@ use ratatui::widgets::Widget;
 use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
-use ratatui_image::{Image, Resize};
+use ratatui_image::{FontSize, Image, Resize};
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::sync::OnceLock;
@@ -39,14 +39,30 @@ impl Cover {
     /// Must be called after raw mode is enabled so the query can round-trip, and
     /// before any thread is spawned — see [`untmuxed_sixel_picker`].
     pub fn make_picker(preferred: Option<&str>) -> Picker {
-        let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-
         // An explicit choice beats every heuristic below — that is the whole
         // point of the escape hatch.
         let forced = std::env::var("MYX_PROTOCOL")
             .ok()
             .or_else(|| preferred.map(String::from))
             .and_then(|want| parse_protocol(&want));
+        let (detected, font_size) = if forced == Some(ProtocolType::Halfblocks) {
+            (None, None)
+        } else {
+            terminal_capabilities()
+        };
+        let font_size = font_size
+            .or_else(|| {
+                crossterm::terminal::window_size()
+                    .ok()
+                    .and_then(|window| cell_size(&window))
+            })
+            .unwrap_or_else(|| FontSize::new(10, 20));
+        // This constructor accepts known metrics without spawning a stdin reader.
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(font_size);
+        if let Some(protocol) = detected {
+            picker.set_protocol_type(protocol);
+        }
 
         // The cover has to survive a window switch, and sixel is the only
         // protocol tmux stores in its own pane buffer and repaints itself.
@@ -62,9 +78,6 @@ impl Cover {
         }
 
         if let Some(proto) = forced {
-            // Set *after* the query so the detected font size survives:
-            // blacklisting a protocol up front loses it and falls back to
-            // halfblocks.
             picker.set_protocol_type(proto);
             return picker;
         }
@@ -185,6 +198,110 @@ impl Cover {
     }
 }
 
+fn cell_size(window: &crossterm::terminal::WindowSize) -> Option<FontSize> {
+    let width = window.width.checked_div(window.columns)?;
+    let height = window.height.checked_div(window.rows)?;
+    (width > 0 && height > 0).then(|| FontSize::new(width, height))
+}
+
+#[cfg(unix)]
+fn terminal_capabilities() -> (Option<ProtocolType>, Option<FontSize>) {
+    use ratatui_image::picker::cap_parser::{Parser, QueryStdioOptions, Response};
+    use std::os::fd::AsFd;
+    let Ok(fd) = io::stdin().as_fd().try_clone_to_owned() else {
+        return (None, None);
+    };
+    // Buffered Stdin can prefetch a keystroke beyond the final query response.
+    let mut input = std::fs::File::from(fd);
+    let mut options = QueryStdioOptions::default();
+    if std::env::var_os("WEZTERM_EXECUTABLE").is_some()
+        || std::env::var_os("KONSOLE_VERSION").is_some()
+    {
+        options.blacklist_protocols = vec![ProtocolType::Kitty, ProtocolType::Sixel];
+    }
+    let query = Parser::query(std::env::var_os("TMUX").is_some(), options);
+    let mut output = io::stdout().lock();
+    if output
+        .write_all(query.as_bytes())
+        .and_then(|_| output.flush())
+        .is_err()
+    {
+        return (None, None);
+    }
+    let responses = read_capabilities(&mut input, std::time::Duration::from_millis(200));
+    let mut protocol = None;
+    let mut font = None;
+    for response in responses {
+        match response {
+            Response::Kitty => protocol = Some(ProtocolType::Kitty),
+            Response::Sixel if protocol.is_none() => protocol = Some(ProtocolType::Sixel),
+            Response::CellSize(Some((width, height))) if width > 0 && height > 0 => {
+                font = Some(FontSize::new(width, height));
+            }
+            _ => {}
+        }
+    }
+    (protocol, font)
+}
+
+#[cfg(not(unix))]
+fn terminal_capabilities() -> (Option<ProtocolType>, Option<FontSize>) {
+    (None, None)
+}
+
+#[cfg(unix)]
+fn read_capabilities(
+    input: &mut (impl io::Read + std::os::fd::AsRawFd),
+    timeout: std::time::Duration,
+) -> Vec<ratatui_image::picker::cap_parser::Response> {
+    use ratatui_image::picker::cap_parser::{Parser, Response};
+    let deadline = std::time::Instant::now() + timeout;
+    let mut parser = Parser::new();
+    let mut responses = Vec::new();
+    let mut remaining = 4096;
+    while remaining > 0 {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        let mut pollfd = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the borrowed input owns a valid descriptor and pollfd lives for the call.
+        let ready = unsafe {
+            libc::poll(
+                &mut pollfd,
+                1,
+                left.as_millis().max(1).min(i32::MAX as u128) as i32,
+            )
+        };
+        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if ready <= 0 || pollfd.revents & libc::POLLIN == 0 {
+            break;
+        }
+        // Read one byte at a time: a key immediately after the final status
+        // reply must stay in the TTY for the event reader.
+        let mut bytes = [0; 1];
+        let count = match input.read(&mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        remaining -= count;
+        for byte in &bytes[..count] {
+            for response in parser.push(char::from(*byte)) {
+                if response == Response::Status {
+                    return responses;
+                }
+                responses.push(response);
+            }
+        }
+    }
+    responses
+}
+
 /// The requested protocol, or `None` for anything unrecognised — a typo must
 /// fall back to detection rather than to a protocol the terminal can't draw.
 fn parse_protocol(want: &str) -> Option<ProtocolType> {
@@ -253,9 +370,7 @@ fn outer_terminal_is_kitty() -> bool {
 /// `set_var` mutates the process-wide environment block, which can reallocate it
 /// under a concurrent `getenv` of *any* variable. [`Cover::make_picker`] is
 /// therefore called from `main` before the tokio runtime and the player engine
-/// exist. The only thread that can still overlap is the one `ratatui-image`
-/// spawns for its terminal query, and by the time the query's result reaches us
-/// that thread is restoring the terminal mode — past its last environment read.
+/// exist. Terminal probing is synchronous and has already returned here.
 ///
 /// ponytail: the clean fix is a `ratatui-image` API for opting out of the tmux
 /// wrapper; until then, the call-site ordering is the guarantee.
@@ -287,6 +402,56 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
     use std::time::Instant;
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_timeout_leaves_the_first_key_for_the_event_reader() {
+        use std::io::{Read, Write};
+        let (mut input, mut terminal) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(read_capabilities(&mut input, std::time::Duration::from_millis(10)).is_empty());
+        terminal.write_all(b"v").unwrap();
+        let mut key = [0];
+        input
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        input.read_exact(&mut key).unwrap();
+        assert_eq!(key, *b"v");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synchronous_probe_reads_capabilities_and_stops_on_status() {
+        use ratatui_image::picker::cap_parser::Response;
+        use std::io::{Read, Write};
+        let (mut input, mut terminal) = std::os::unix::net::UnixStream::pair().unwrap();
+        input
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        terminal.write_all(b"\x1b[6;20;10t\x1b[0nv").unwrap();
+        let responses = read_capabilities(&mut input, std::time::Duration::from_secs(1));
+        assert!(responses.contains(&Response::CellSize(Some((10, 20)))));
+        let mut key = [0];
+        input.read_exact(&mut key).unwrap();
+        assert_eq!(key, *b"v");
+    }
+
+    #[test]
+    fn font_metrics_use_os_pixels_and_reject_unknown_dimensions() {
+        let mut window = crossterm::terminal::WindowSize {
+            rows: 30,
+            columns: 80,
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(
+            cell_size(&window).map(|size| (size.width, size.height)),
+            Some((10, 20))
+        );
+        window.width = 0;
+        assert!(cell_size(&window).is_none());
+        window.columns = 0;
+        assert!(cell_size(&window).is_none());
+    }
 
     #[test]
     fn a_protocol_name_maps_to_its_protocol_and_a_typo_to_detection() {

@@ -2,6 +2,31 @@
 
 use crate::*;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UiKeyAction {
+    Section(isize),
+    View(isize),
+    Seek(i64),
+    Shuffle,
+    PlayContext,
+    Waveform,
+}
+
+pub(crate) fn ui_key_action(code: KeyCode, mods: KeyModifiers) -> Option<UiKeyAction> {
+    Some(match code {
+        KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => UiKeyAction::Seek(-SEEK_STEP_MS),
+        KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => UiKeyAction::Seek(SEEK_STEP_MS),
+        KeyCode::Left | KeyCode::Char('[') => UiKeyAction::Section(-1),
+        KeyCode::Right | KeyCode::Char(']') => UiKeyAction::Section(1),
+        KeyCode::Tab => UiKeyAction::View(1),
+        KeyCode::BackTab => UiKeyAction::View(-1),
+        KeyCode::Char('S') => UiKeyAction::Shuffle,
+        KeyCode::Char('P') => UiKeyAction::PlayContext,
+        KeyCode::Char('v') => UiKeyAction::Waveform,
+        _ => return None,
+    })
+}
+
 /// Returns true if the app should quit.
 pub(crate) fn handle_key(
     app: &mut App,
@@ -74,7 +99,37 @@ pub(crate) fn handle_key(
     // Zen hides the library, so the keys that drive one do nothing rather than
     // moving a selection nobody can see. Placed after the overlays above, which
     // stay usable if one was already open when zen came on.
-    if app.view.zen && drives_library(code) {
+    let seek = matches!(code, KeyCode::Left | KeyCode::Right) && mods.contains(KeyModifiers::SHIFT);
+    if app.view.zen && drives_library(code) && !seek {
+        return false;
+    }
+
+    if let Some(action) = ui_key_action(code, mods) {
+        match action {
+            UiKeyAction::Section(delta) => {
+                app.session.search_request.cancel();
+                app.session.detail_request.cancel();
+                app.browse.details.clear();
+                app.search.searching = false;
+                app.browse.section = app.browse.section.shift(delta);
+                app.browse.selected = app.first_selectable();
+            }
+            UiKeyAction::View(delta) => {
+                app.view.mode = app.view.mode.shift(delta);
+                if app.view.mode == RightView::Queue && app.transport.playback_started {
+                    request_visible_queue(app, chans);
+                }
+            }
+            UiKeyAction::Seek(delta) => app.playback.seek_step(delta),
+            UiKeyAction::Shuffle => {
+                let _ = app.svc.engine.shuffle(!app.transport.shuffle);
+            }
+            UiKeyAction::PlayContext => play_selected_context(app, false),
+            UiKeyAction::Waveform => {
+                app.view.waveform_visible = !app.view.waveform_visible;
+                app.art_repaint = ArtRepaint::Wipe;
+            }
+        }
         return false;
     }
 
@@ -148,17 +203,6 @@ pub(crate) fn handle_key(
                 .engine
                 .set_volume(vol_u16(app.transport.volume.saturating_sub(5)));
         }
-        KeyCode::Char('s') => {
-            let _ = app.svc.engine.shuffle(!app.transport.shuffle);
-        }
-        // Play the highlighted playlist / album / artist outright. Enter still
-        // opens; this is the direct route that used to require two Enters or
-        // the actions menu.
-        KeyCode::Char('P') => play_selected_context(app, false),
-        KeyCode::Char('S') => {
-            // Keep the visible toggle consistent with this explicit request.
-            play_selected_context(app, true);
-        }
         KeyCode::Char('R') => {
             let repeat = match app.transport.repeat {
                 RepeatMode::Off => RepeatMode::All,
@@ -183,6 +227,9 @@ pub(crate) fn handle_key(
             }
         }
         KeyCode::Char('o') => {
+            if app.home_groups_visible() {
+                return false;
+            }
             app.browse.sort = app.browse.sort.next();
             let m = app.browse.sort;
             sort_list(app.cur_list_mut(), m);
@@ -211,42 +258,6 @@ pub(crate) fn handle_key(
                     let id = app.session.menu_request.start();
                     spawn_action_menu(app.svc.webapi.clone(), item, id, chans.menu.clone());
                 }
-            }
-        }
-        // Tab / Shift+Tab (and [ ]) rotate the library sections.
-        KeyCode::Tab | KeyCode::Char(']') => {
-            app.session.search_request.cancel();
-            app.session.detail_request.cancel();
-            app.browse.details.clear();
-            app.search.searching = false;
-            app.browse.section = app.browse.section.shift(1);
-            app.browse.selected = app.first_selectable();
-        }
-        KeyCode::BackTab | KeyCode::Char('[') => {
-            app.session.search_request.cancel();
-            app.session.detail_request.cancel();
-            app.browse.details.clear();
-            app.search.searching = false;
-            app.browse.section = app.browse.section.shift(-1);
-            app.browse.selected = app.first_selectable();
-        }
-        // Arrow keys rotate the right-pane view; Shift+arrows seek ±5s.
-        KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => {
-            app.playback.seek_step(SEEK_STEP_MS)
-        }
-        KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => {
-            app.playback.seek_step(-SEEK_STEP_MS)
-        }
-        KeyCode::Right => {
-            app.view.mode = app.view.mode.shift(1);
-            if app.view.mode == RightView::Queue && app.transport.playback_started {
-                request_visible_queue(app, chans);
-            }
-        }
-        KeyCode::Left => {
-            app.view.mode = app.view.mode.shift(-1);
-            if app.view.mode == RightView::Queue && app.transport.playback_started {
-                request_visible_queue(app, chans);
             }
         }
         // The frame loop notices the layout change and wipes the art box.
@@ -296,12 +307,12 @@ fn request_visible_queue(app: &mut App, _chans: &UiChannels) {
 pub(crate) fn drives_library(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Tab
-            | KeyCode::BackTab
+        KeyCode::Left
+            | KeyCode::Right
             | KeyCode::Up
             | KeyCode::Down
             | KeyCode::Enter
             | KeyCode::Esc
-            | KeyCode::Char('/' | '[' | ']' | 'j' | 'k' | 'o' | 'r' | 'P' | 'S')
+            | KeyCode::Char('/' | '[' | ']' | 'j' | 'k' | 'o' | 'r' | 'P')
     )
 }

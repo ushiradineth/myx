@@ -92,13 +92,14 @@ pub(crate) fn handle_mouse(
                     && m.row < lr.y + lr.height
                 {
                     let idx = out.lib_offset + (m.row - lr.y) as usize;
-                    let selectable = app
-                        .cur_items()
-                        .get(idx)
-                        .map(|it| !it.is_header())
-                        .unwrap_or(false);
+                    let selectable = app.row_selectable(idx);
                     if selectable {
                         app.browse.selected = idx;
+                        if app.home_groups_visible() && app.cur_items()[idx].is_header() {
+                            app.browse.library.toggle_home_group(idx);
+                            app.session.last_click = None;
+                            return false;
+                        }
                         let now = Instant::now();
                         let dbl = app
                             .session

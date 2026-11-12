@@ -1,4 +1,4 @@
-//! Strict collection detail, with a separately reported unavailable Popular endpoint.
+//! Collection detail, with availability-filtered discography and an honest Popular notice.
 use super::*;
 use crate::*;
 
@@ -60,11 +60,26 @@ pub(crate) fn artist_top_tracks(
 }
 
 pub(crate) fn artist_albums(
-    fetch: impl FnMut(&str) -> FetchResult<serde_json::Value>,
+    mut fetch: impl FnMut(&str) -> FetchResult<serde_json::Value>,
     id: &str,
 ) -> FetchResult<Vec<LibItem>> {
     let mut albums = myx::webapi::catalog::collect_pages(
-        fetch,
+        |path| {
+            let mut page = fetch(path)?;
+            // Public discography has no documented cross-page snapshot guarantee.
+            // Use provider `next` as EOF, not total equality as a revision check.
+            // Keep the shared collector's origin, cycle, malformed-page and error checks;
+            // playlist totals and before/after snapshot verification remain untouched.
+            match page.get("total") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(total) if total.as_u64().is_some() => {}
+                _ => return Err(ApiError::InvalidResponse),
+            }
+            if let Some(object) = page.as_object_mut() {
+                object.remove("total");
+            }
+            Ok(page)
+        },
         &format!("{API}/artists/{id}/albums?include_groups=album,single&limit=10"),
         None,
     )?;
@@ -116,7 +131,7 @@ pub(crate) fn fetch_detail_with(
                 }
                 Err(error @ (ApiError::Restricted | ApiError::NotFound)) => {
                     notice = Some(format!("Popular unavailable: {error}"));
-                    items.push(LibItem::header("Popular unavailable for this account"));
+                    items.push(LibItem::header("Popular unavailable from Spotify"));
                 }
                 Err(error) => return Err(error),
             }

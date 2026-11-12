@@ -45,7 +45,7 @@ use myx::soloist::protocol::{ObservedMetadata as TrackMetadata, PlayerEvent as E
 use myx::term::{init_terminal, restore_terminal, Term};
 use myx::theme::{Theme, TOKYONIGHT};
 use myx::util::{center_v, fmt_ms, track_id_from_uri, truncate, uri_to_url, urlencode, vol_u16};
-use ui::{render, render_loading};
+use ui::{render, render_loading, spectrum_demand};
 
 struct Startup {
     connection: Connection,
@@ -214,6 +214,7 @@ async fn boot(terminal: &mut Term, startup: Startup, picker: Picker) -> Result<(
         view: ViewState {
             mode: RightView::NowPlaying,
             zen: false,
+            waveform_visible: true,
             lyrics: Vec::new(),
             lyrics_synced: false,
             actions: None,
@@ -395,9 +396,10 @@ async fn run_ui(
                 request_library_section(&mut app, &chans, false);
                 if app.view.mode == RightView::Lyrics { request_lyrics(&mut app, &chans.lyrics); }
                 app.playback.flush_seek(&app.svc.engine, Instant::now());
-                let spectrum_visible = app.view.mode == RightView::NowPlaying
-                    && app.view.actions.is_none() && app.view.equalizer.is_none()
-                    && out.spectrum.is_some();
+                let spectrum_visible = spectrum_demand(
+                    app.view.waveform_visible, app.view.mode,
+                    app.view.actions.is_some() || app.view.equalizer.is_some(), out.spectrum,
+                );
                 if spectrum_visible != spectrum_enabled {
                     app.svc.engine.set_spectrum_enabled(spectrum_visible);
                     spectrum_enabled = spectrum_visible;
@@ -406,9 +408,7 @@ async fn run_ui(
                     let delivered = reply.result.is_ok();
                     if !app.browse.library.receive(section, reply) { continue; }
                     dirty = true;
-                    if delivered {
-                        let items = app.browse.library.items_mut(section);
-                        for (i, item) in items.iter_mut().enumerate() { item.order = i as u32; }
+                    if delivered && section != Section::Home {
                         sort_list(app.browse.library.items_mut(section), app.browse.sort);
                     }
                     if section == app.browse.section && !app.search.searching && app.browse.details.is_empty() {

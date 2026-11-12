@@ -19,7 +19,17 @@ pub(crate) fn render_visualizer(f: &mut Frame, app: &App, theme: Theme, area: Re
     let values: [f32; NUM_BANDS] = guard.values;
     let peak = guard.peak_envelope.max(1e-6);
     drop(guard);
+    render_spectrum(f, &values, peak, theme, area);
+}
 
+pub(crate) fn render_spectrum(
+    f: &mut Frame,
+    values: &[f32; NUM_BANDS],
+    peak: f32,
+    theme: Theme,
+    area: Rect,
+) {
+    let peak = peak.max(1e-6);
     // Cap the spectrum to a centered band — full-pane bars are too tall/wide.
     let vh = ((area.height as u32 * 3 / 5) as u16)
         .clamp(6, 14)
